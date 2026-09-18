@@ -1,2 +1,4 @@
-mcp
-python-dotenv
+mcp>=2.2,<3
+python-dotenv>=1,<2
+fastembed>=0.8,<1
+numpy>=2,<3

@@ -6,6 +6,8 @@ import numpy as np
 from dotenv import load_dotenv
 from fastembed import TextEmbedding
 from mcp.server.mcpserver import MCPServer
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from notion_client import (
     NotionClient,
@@ -55,6 +57,12 @@ USAGE_GUIDE = """\
 
 mcp = MCPServer(name="gh-notion-bot", instructions=USAGE_GUIDE)
 notion = NotionClient()
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(_request: Request) -> JSONResponse:
+    """Railway liveness/readiness endpoint."""
+    return JSONResponse({"status": "ok"})
 
 
 def _and(*filters):
@@ -197,4 +205,17 @@ def semantic_search(query: str, top_k: int = 5, source: str = "") -> list[dict]:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        mcp.run(
+            transport="streamable-http",
+            host=os.getenv("HOST", "0.0.0.0"),
+            port=int(os.getenv("PORT", "8000")),
+            streamable_http_path=os.getenv("MCP_PATH", "/mcp"),
+        )
+    elif transport == "stdio":
+        mcp.run()
+    else:
+        raise ValueError(
+            f"Unsupported MCP_TRANSPORT={transport!r}; use 'stdio' or 'streamable-http'"
+        )
