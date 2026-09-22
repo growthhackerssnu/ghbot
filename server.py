@@ -362,6 +362,7 @@ def _build_http_app():
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse, PlainTextResponse
     from starlette.routing import Route
+    from mcp.server.transport_security import TransportSecuritySettings
 
     members = _load_members()
     if not members:
@@ -380,7 +381,22 @@ def _build_http_app():
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
             return await call_next(request)
 
-    mcp_app = mcp.streamable_http_app(streamable_http_path=os.environ.get("MCP_PATH", "/mcp"))
+    # mcp.streamable_http_app() defaults to allowing only 127.0.0.1/localhost
+    # Host headers (DNS-rebinding protection) when no transport_security is
+    # given - which 421s every request from a real public domain. Explicitly
+    # allow the deployed host(s); comma-separated via ALLOWED_HOSTS for
+    # flexibility (e.g. adding the *.up.railway.app fallback domain).
+    allowed_hosts = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "api.ghsnu.com").split(",") if h.strip()]
+    allowed_hosts += ["127.0.0.1:*", "localhost:*"]
+    transport_security = TransportSecuritySettings(
+        allowed_hosts=allowed_hosts,
+        allowed_origins=[f"https://{h}" for h in allowed_hosts] + ["http://127.0.0.1:*", "http://localhost:*"],
+    )
+
+    mcp_app = mcp.streamable_http_app(
+        streamable_http_path=os.environ.get("MCP_PATH", "/mcp"),
+        transport_security=transport_security,
+    )
 
     async def health(request):
         return PlainTextResponse("ok")
