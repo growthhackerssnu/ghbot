@@ -79,7 +79,27 @@ USAGE_GUIDE = """\
 "찾은 자료 안에서는 확인되지 않음"이라고 명시하고, 없는 내용을 지어내지 마세요.
 """
 
-mcp = MCPServer(name="gh-notion-bot", instructions=USAGE_GUIDE)
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+from oauth_provider import MemberOAuthProvider, load_members
+
+OAUTH_ISSUER_URL = os.environ.get("OAUTH_ISSUER_URL", "https://api.ghsnu.com")
+
+mcp = MCPServer(
+    name="gh-notion-bot",
+    instructions=USAGE_GUIDE,
+    auth_server_provider=MemberOAuthProvider(),
+    auth=AuthSettings(
+        issuer_url=OAUTH_ISSUER_URL,
+        resource_server_url=OAUTH_ISSUER_URL,
+        client_registration_options=ClientRegistrationOptions(enabled=True, default_scopes=["*"]),
+        # Left unset (not True): our AccessToken.resource is often None (legacy
+        # static tokens, and OAuth tokens when the client doesn't send a RFC8707
+        # resource indicator) - _issued_for_this_resource() has no None-guard,
+        # so enabling this would 500 on exactly those tokens. Revisit once every
+        # token path reliably sets `resource`.
+        validate_token_resource=False,
+    ),
+)
 notion = NotionClient()
 drive = DriveClient()
 
@@ -332,60 +352,119 @@ def semantic_search(query: str, top_k: int = 5, source: str = "") -> list[dict]:
     ]
 
 
-def _load_members() -> dict[str, str]:
-    """Members can come from a MEMBERS_JSON env var (for platforms like Railway
-    with no persistent/committed filesystem - set it as a secret env var, never
-    commit tokens to git) or from members.json locally. Env var wins if set.
-    """
-    import json
+LOGIN_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>그핵봇 로그인</title>
+<style>
+body{{font-family:-apple-system,sans-serif;max-width:420px;margin:60px auto;padding:0 16px;color:#111;}}
+input{{width:100%;padding:10px;font-size:16px;box-sizing:border-box;margin:8px 0;border:1px solid #ccc;border-radius:6px;}}
+button{{width:100%;padding:10px;font-size:16px;background:#111;color:#fff;border:none;border-radius:6px;cursor:pointer;}}
+.err{{color:#c0392b;font-size:14px;}}
+</style></head>
+<body>
+<h2>그핵봇 로그인</h2>
+<p>운영진에게 발급받은 토큰(<code>ghbot_</code>로 시작)을 입력하세요.</p>
+{error}
+<form method="post">
+<input type="hidden" name="client_id" value="{client_id}">
+<input type="hidden" name="state" value="{state}">
+<input type="hidden" name="redirect_uri" value="{redirect_uri}">
+<input type="hidden" name="code_challenge" value="{code_challenge}">
+<input type="hidden" name="scope" value="{scope}">
+<input type="hidden" name="resource" value="{resource}">
+<input type="text" name="token" placeholder="ghbot_..." autofocus required>
+<button type="submit">로그인</button>
+</form>
+</body></html>"""
 
-    inline = os.environ.get("MEMBERS_JSON")
-    if inline:
-        return json.loads(inline)
-    members_file = Path(__file__).parent / "members.json"
-    if not members_file.exists():
-        return {}
-    return json.loads(members_file.read_text(encoding="utf-8"))
+
+def _login_page(params, error: str = "") -> str:
+    import html as html_lib
+
+    def esc(key):
+        return html_lib.escape(params.get(key, "") or "")
+
+    return LOGIN_PAGE.format(
+        error=f'<p class="err">{error}</p>' if error else "",
+        client_id=esc("client_id"),
+        state=esc("state"),
+        redirect_uri=esc("redirect_uri"),
+        code_challenge=esc("code_challenge"),
+        scope=esc("scope"),
+        resource=esc("resource"),
+    )
+
+
+@mcp.custom_route("/login", methods=["GET", "POST"])
+async def login(request):
+    import json as _json
+    import secrets as _secrets
+    import time as _time
+    from urllib.parse import urlencode
+
+    from starlette.responses import HTMLResponse, RedirectResponse
+
+    import oauth_provider
+
+    if request.method == "GET":
+        params = dict(request.query_params)
+        return HTMLResponse(_login_page(params))
+
+    form = await request.form()
+    params = dict(form)
+    token = (params.get("token") or "").strip()
+    members = oauth_provider.load_members()
+    member_name = members.get(token)
+    if not member_name:
+        return HTMLResponse(_login_page(params, error="토큰이 올바르지 않습니다."), status_code=401)
+
+    code = "ghcode_" + _secrets.token_urlsafe(24)
+    conn = oauth_provider.connect()
+    conn.execute(
+        "INSERT INTO oauth_codes (code, client_id, scopes, expires_at, code_challenge, redirect_uri, "
+        "redirect_uri_explicit, resource, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            code,
+            params.get("client_id", ""),
+            _json.dumps((params.get("scope") or "").split()),
+            _time.time() + oauth_provider.CODE_TTL_SECONDS,
+            params.get("code_challenge", ""),
+            params.get("redirect_uri", ""),
+            1,
+            params.get("resource") or None,
+            member_name,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    redirect_uri = params.get("redirect_uri", "")
+    sep = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(
+        f"{redirect_uri}{sep}{urlencode({'code': code, 'state': params.get('state', '')})}",
+        status_code=302,
+    )
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request):
+    from starlette.responses import PlainTextResponse
+
+    return PlainTextResponse("ok")
 
 
 def _build_http_app():
-    """Wraps the MCP streamable-http app with bearer-token gating so only
-    tokens issued via manage_members.py can reach any tool. Claude and ChatGPT
-    custom connectors both support sending a static bearer token/API key for
-    a remote MCP server, so this doesn't need a full OAuth server.
+    """mcp.streamable_http_app() defaults to allowing only 127.0.0.1/localhost
+    Host headers (DNS-rebinding protection) when no transport_security is
+    given - which 421s every request from a real public domain. Explicitly
+    allow the deployed host(s); comma-separated via ALLOWED_HOSTS for
+    flexibility (e.g. adding the *.up.railway.app fallback domain).
 
-    Built manually (rather than mcp.run(transport="streamable-http")) because
-    that helper doesn't expose a way to add middleware or extra routes, and
-    Railway's healthcheckPath (/health) needs a route outside the MCP protocol.
+    Bearer-token auth (both OAuth-issued and legacy static tokens) is handled
+    by the mcp SDK itself via auth_server_provider - no custom middleware
+    needed here anymore.
     """
-    from starlette.applications import Starlette
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import JSONResponse, PlainTextResponse
-    from starlette.routing import Route
     from mcp.server.transport_security import TransportSecuritySettings
 
-    members = _load_members()
-    if not members:
-        raise RuntimeError(
-            "No members configured - run `python manage_members.py add <name>` first "
-            "(or set MEMBERS_JSON). Refusing to start an open, unauthenticated remote server."
-        )
-
-    class MemberAuthMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request, call_next):
-            if request.url.path == "/health":
-                return await call_next(request)
-            auth_header = request.headers.get("authorization", "")
-            token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else None
-            if not token or token not in members:
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
-            return await call_next(request)
-
-    # mcp.streamable_http_app() defaults to allowing only 127.0.0.1/localhost
-    # Host headers (DNS-rebinding protection) when no transport_security is
-    # given - which 421s every request from a real public domain. Explicitly
-    # allow the deployed host(s); comma-separated via ALLOWED_HOSTS for
-    # flexibility (e.g. adding the *.up.railway.app fallback domain).
     allowed_hosts = [h.strip() for h in os.environ.get("ALLOWED_HOSTS", "api.ghsnu.com").split(",") if h.strip()]
     allowed_hosts += ["127.0.0.1:*", "localhost:*"]
     transport_security = TransportSecuritySettings(
@@ -393,21 +472,12 @@ def _build_http_app():
         allowed_origins=[f"https://{h}" for h in allowed_hosts] + ["http://127.0.0.1:*", "http://localhost:*"],
     )
 
-    mcp_app = mcp.streamable_http_app(
+    members = load_members()
+    print(f"[gh-notion-bot] {len(members)} legacy static token(s), OAuth login at /login, serving at /mcp")
+    return mcp.streamable_http_app(
         streamable_http_path=os.environ.get("MCP_PATH", "/mcp"),
         transport_security=transport_security,
     )
-
-    async def health(request):
-        return PlainTextResponse("ok")
-
-    app = Starlette(
-        routes=[Route("/health", health), *mcp_app.routes],
-        lifespan=mcp_app.router.lifespan_context,
-    )
-    app.add_middleware(MemberAuthMiddleware)
-    print(f"[gh-notion-bot] {len(members)} member(s) allowed, serving at /mcp (+ /health)")
-    return app
 
 
 if __name__ == "__main__":
