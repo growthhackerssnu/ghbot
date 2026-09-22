@@ -35,6 +35,7 @@ class NotionClient:
         self.api_key = api_key or os.environ.get("NOTION_API_KEY")
         if not self.api_key:
             raise RuntimeError("NOTION_API_KEY is not set (check your .env file)")
+        self._title_cache: dict[str, str] = {}
 
     def _request(self, method: str, path: str, body: dict | None = None, version: str = NOTION_VERSION) -> dict:
         data = json.dumps(body).encode() if body is not None else None
@@ -94,24 +95,42 @@ class NotionClient:
         data_source_id: str,
         filter_: dict | None = None,
         sorts: list[dict] | None = None,
-        page_size: int = 50,
+        page_size: int = 100,
+        max_rows: int = 1000,
     ) -> list[dict]:
-        """Query a data source (the queryable schema+rows behind a database)."""
-        body: dict = {"page_size": page_size}
-        if filter_:
-            body["filter"] = filter_
-        if sorts:
-            body["sorts"] = sorts
-        result = self._request(
-            "POST",
-            f"data_sources/{data_source_id}/query",
-            body,
-            version=DATA_SOURCE_API_VERSION,
-        )
-        return [self._flatten_page(p) for p in result.get("results", [])]
+        """Query a data source (the queryable schema+rows behind a database).
+
+        Follows pagination automatically up to max_rows - a single 100-row
+        page silently truncating a larger database was a real bug here before.
+        """
+        all_pages: list[dict] = []
+        cursor = None
+        while True:
+            body: dict = {"page_size": min(page_size, 100)}
+            if filter_:
+                body["filter"] = filter_
+            if sorts:
+                body["sorts"] = sorts
+            if cursor:
+                body["start_cursor"] = cursor
+            result = self._request(
+                "POST",
+                f"data_sources/{data_source_id}/query",
+                body,
+                version=DATA_SOURCE_API_VERSION,
+            )
+            all_pages.extend(result.get("results", []))
+            if not result.get("has_more") or len(all_pages) >= max_rows:
+                break
+            cursor = result.get("next_cursor")
+        return [self._flatten_page(p) for p in all_pages[:max_rows]]
 
     def _flatten_page(self, page: dict) -> dict:
-        flat = {"id": page.get("id"), "url": page.get("url")}
+        flat = {
+            "id": page.get("id"),
+            "url": page.get("url"),
+            "last_edited_time": page.get("last_edited_time"),
+        }
         for name, prop in page.get("properties", {}).items():
             flat[name] = self._flatten_property(prop)
         return flat
@@ -139,16 +158,28 @@ class NotionClient:
             return value
         return value
 
+    def get_page(self, page_id: str) -> dict:
+        """Fetch a single page and flatten its properties, same shape as a query_database row."""
+        return self._flatten_page(self._request("GET", f"pages/{page_id}"))
+
     def resolve_titles(self, page_ids: list[str]) -> dict[str, str]:
-        """Given page ids (e.g. from a relation property), fetch their titles."""
+        """Given page ids (e.g. from a relation property), fetch their titles.
+
+        Cached per-client since the same company/person ids recur across many
+        query_projects/query_archive calls in one server process.
+        """
         titles: dict[str, str] = {}
         for pid in dict.fromkeys(page_ids):  # dedupe, keep order
+            if pid in self._title_cache:
+                titles[pid] = self._title_cache[pid]
+                continue
             page = self._request("GET", f"pages/{pid}")
             title = ""
             for prop in page.get("properties", {}).values():
                 if prop.get("type") == "title":
                     title = "".join(t.get("plain_text", "") for t in prop.get("title", []))
                     break
+            self._title_cache[pid] = title
             titles[pid] = title
         return titles
 
