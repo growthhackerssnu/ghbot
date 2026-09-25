@@ -2,6 +2,7 @@ import io
 import os
 import re
 
+from config import load_json_env
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -73,11 +74,8 @@ class DriveClient:
         # platforms like Railway with no committed/persistent filesystem, set
         # this as a secret env var instead of shipping the key file. Falls
         # back to a local file path for local dev.
-        inline_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-        if inline_json:
-            import json
-
-            info = json.loads(inline_json)
+        info = load_json_env("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if info:
             creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
         else:
             path = service_account_file or os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE")
@@ -121,6 +119,36 @@ class DriveClient:
             if not token:
                 break
         return files
+
+    def list_all_folders(self) -> list[dict]:
+        """List folder metadata only; useful for a fast Drive sitemap."""
+        folders: list[dict] = []
+        token = None
+        while True:
+            result = self.service.files().list(
+                q=f"mimeType = '{FOLDER_MIME}' and trashed = false",
+                pageSize=1000,
+                pageToken=token,
+                fields="nextPageToken, files(id,name,mimeType,modifiedTime,parents,webViewLink)",
+            ).execute()
+            folders.extend(result.get("files", []))
+            token = result.get("nextPageToken")
+            if not token:
+                return folders
+
+    def list_children(self, parent_id: str, page_size: int = 100, page_token: str | None = None) -> dict:
+        """List immediate Drive children and preserve the next-page token."""
+        result = self.service.files().list(
+            q=f"'{parent_id}' in parents and trashed = false",
+            pageSize=min(page_size, 1000),
+            pageToken=page_token,
+            orderBy="folder,name",
+            fields="nextPageToken, files(id,name,mimeType,modifiedTime,parents,webViewLink)",
+        ).execute()
+        return {
+            "results": result.get("files", []),
+            "next_page_token": result.get("nextPageToken"),
+        }
 
     def resolve_file_teams(self, all_files: list[dict] | None = None) -> tuple[dict[str, str], dict[str, dict]]:
         """Resolve each non-folder file to its TEAM_FOLDERS team, entirely from

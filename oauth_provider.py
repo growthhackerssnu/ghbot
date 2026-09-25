@@ -15,6 +15,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+from config import load_json_env
 from mcp.server.auth.provider import AccessToken, AuthorizationCode, AuthorizationParams, RefreshToken
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
@@ -45,9 +46,9 @@ def connect() -> sqlite3.Connection:
 
 
 def load_members() -> dict[str, str]:
-    inline = os.environ.get("MEMBERS_JSON")
+    inline = load_json_env("MEMBERS_JSON")
     if inline:
-        return json.loads(inline)
+        return inline
     members_file = Path(__file__).parent / "members.json"
     if members_file.exists():
         return json.loads(members_file.read_text(encoding="utf-8"))
