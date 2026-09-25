@@ -45,3 +45,10 @@ create table if not exists public.ghbot_notion_content (
 
 create index if not exists ghbot_notion_content_title_idx
     on public.ghbot_notion_content (title);
+
+-- These tables contain private Notion/Drive material. Do not expose them via
+-- the publishable/anon key. The MCP server and sync worker use SUPABASE_KEY.
+alter table public.ghbot_chunks enable row level security;
+alter table public.ghbot_pages enable row level security;
+alter table public.ghbot_drive_files enable row level security;
+alter table public.ghbot_notion_content enable row level security;

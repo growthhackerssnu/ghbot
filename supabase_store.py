@@ -35,15 +35,16 @@ class SupabaseStore:
             or os.environ.get("SUPABASE_URL", "")
             or os.environ.get("NEXT_PUBLIC_SUPABASE_URL", "")
         ).rstrip("/")
-        self.key = (
-            key
-            or os.environ.get("SUPABASE_KEY", "")
-            or os.environ.get("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY", "")
-        )
+        self.private_key = key or os.environ.get("SUPABASE_KEY", "")
+        self.key = self.private_key or os.environ.get("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY", "")
 
     @property
     def enabled(self) -> bool:
         return bool(self.url and self.key)
+
+    @property
+    def private_enabled(self) -> bool:
+        return bool(self.url and self.private_key)
 
     def require_enabled(self) -> None:
         if not self.enabled:
@@ -51,6 +52,16 @@ class SupabaseStore:
                 "Supabase index is not configured. Set SUPABASE_URL and SUPABASE_KEY "
                 "(or the NEXT_PUBLIC_SUPABASE_* equivalents)."
             )
+
+    def require_private(self) -> None:
+        if not self.private_enabled:
+            raise RuntimeError(
+                "This operation requires SUPABASE_KEY (a private backend/service-role key); "
+                "the NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY is not sufficient."
+            )
+
+    def require_write_enabled(self) -> None:
+        self.require_private()
 
     def _request(
         self,
@@ -129,6 +140,7 @@ class SupabaseStore:
     def upsert(self, table: str, rows: list[dict], *, on_conflict: str) -> list[dict]:
         if not rows:
             return []
+        self.require_write_enabled()
         result = self._request(
             "POST",
             table,
@@ -139,4 +151,5 @@ class SupabaseStore:
         return result if isinstance(result, list) else []
 
     def delete(self, table: str, filters: list[tuple[str, str]]) -> None:
+        self.require_write_enabled()
         self._request("DELETE", table, params=filters, prefer="return=minimal")

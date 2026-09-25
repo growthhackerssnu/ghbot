@@ -879,7 +879,7 @@ def search_notion_content(
     )
     scope_by_id = {node["id"]: node for node in scope_pages}
 
-    supabase.require_enabled()
+    supabase.require_private()
     cached_rows = supabase.select_all("ghbot_notion_content")
     cached = {row["page_id"]: row.get("last_edited_time") for row in cached_rows}
     started = time.monotonic()
@@ -979,7 +979,7 @@ def search_drive(query: str, team: str = "") -> list[dict]:
                 columns="file_id",
                 filters=[("team", f"eq.{team}")],
             )
-        } if supabase.enabled else set()
+        } if supabase.private_enabled else set()
         if allowed_ids:
             results = [r for r in results if r["id"] in allowed_ids]
         else:
@@ -1028,7 +1028,7 @@ def _load_semantic_index():
     global _embed_model
     if _embed_model is None:
         _embed_model = TextEmbedding(model_name=EMBED_MODEL_NAME)
-    supabase.require_enabled()
+    supabase.require_private()
     rows = supabase.select_all(
         "ghbot_chunks",
         columns="page_id,url,title,source_label,chunk_text,embedding,last_edited,chunk_index",

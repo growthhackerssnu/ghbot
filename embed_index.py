@@ -50,7 +50,7 @@ def _batches(rows, size=200):
 
 def publish_sqlite_index(conn, store: SupabaseStore) -> None:
     """Publish the local build result into the canonical Supabase tables."""
-    store.require_enabled()
+    store.require_write_enabled()
 
     chunk_rows = []
     for row in conn.execute(
@@ -347,7 +347,7 @@ def run(
         """
     )
     conn.commit()
-    if store.enabled and not full_rebuild:
+    if store.private_enabled and not full_rebuild:
         hydrate_staging_index(conn, store)
 
     from fastembed import TextEmbedding
@@ -363,10 +363,10 @@ def run(
 
     removed = indexer.sweep_removed()
     total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-    if store.enabled:
+    if store.private_enabled:
         publish_sqlite_index(conn, store)
     else:
-        print("warning: SUPABASE_URL/SUPABASE_KEY not set; index was only written locally")
+        print("warning: private SUPABASE_KEY not set; index was only written locally")
     summary = {
         "updated": indexer.updated,
         "unchanged": indexer.unchanged,
@@ -374,7 +374,7 @@ def run(
         "removed": removed,
         "total_chunks": total_chunks,
         "db_path": str(DB_PATH),
-        "published": store.enabled,
+        "published": store.private_enabled,
     }
     print(
         f"done - {indexer.updated} updated, {indexer.unchanged} unchanged (skipped re-embed), "

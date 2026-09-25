@@ -26,8 +26,9 @@ Supabase에서는 먼저 `supabase_schema.sql`을 SQL Editor에서 실행하세�
 그 다음 `SUPABASE_URL`과 private backend/service-role 성격의 `SUPABASE_KEY`를
 설정합니다. 이 키는 서버 전용이므로 클라이언트나 저장소에 노출하면 안 됩니다.
 기존 프로젝트의 `NEXT_PUBLIC_SUPABASE_URL`은 URL로도 인식되지만,
-`NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`는 읽기 전용 확인용으로만 두고
-인덱스 게시에는 private key를 사용하세요.
+MCP 서버와 인덱서에는 반드시 `SUPABASE_KEY`에 private/service-role 키를
+넣으세요. `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`는 RLS가 적용된 인덱스에
+사용할 수 없습니다.
 
 ## 3. 동작 확인
 ```bash
