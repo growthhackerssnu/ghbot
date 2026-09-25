@@ -52,7 +52,7 @@ class NotionClient:
                 "Content-Type": "application/json",
             },
         )
-        max_attempts = 3
+        max_attempts = 4
         for attempt in range(1, max_attempts + 1):
             try:
                 with urllib.request.urlopen(req, timeout=30) as resp:
@@ -66,7 +66,16 @@ class NotionClient:
                         f"'...' menu -> Connections -> add the integration)."
                     ) from e
                 if e.code == 429 and attempt < max_attempts:
-                    time.sleep(2 * attempt)
+                    # Notion supplies a retry_after value in the error body
+                    # for burst limits. Respect it so chained DB joins do not
+                    # immediately exhaust the next retry as well.
+                    retry_after = 2 * attempt
+                    try:
+                        detail = json.loads(payload).get("additional_data", {})
+                        retry_after = max(retry_after, float(detail.get("retry_after", 0)))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+                    time.sleep(retry_after)
                     continue
                 raise RuntimeError(f"Notion API error {e.code} on {path}: {payload}") from e
             except (http.client.RemoteDisconnected, ConnectionError, TimeoutError, urllib.error.URLError) as e:
@@ -239,7 +248,11 @@ class NotionClient:
                 return None
             return {"start": value.get("start"), "end": value.get("end")}
         if ptype == "people":
-            return [p.get("name") for p in value or []]
+            # Notion's user object can omit ``name`` (for example when the
+            # integration cannot read a member profile), but its stable ID is
+            # still present. Keep that ID so a People DB's ``Notion ID`` can
+            # be used to filter Tasks' ``관련 인원`` people property.
+            return [p.get("id") for p in value or []]
         if ptype == "relation":
             return [r.get("id") for r in value or []]
         if ptype in ("number", "checkbox", "url", "email", "phone_number"):

@@ -40,6 +40,18 @@ USAGE_GUIDE = """\
    scope_filters를 search_notion_content에 그대로 넘길 수 있습니다. 질문에 날짜가
    명시되지 않았다면 날짜 필터를 임의로 추가하지 마세요.
 
+DB 간 다단계 탐색 원칙:
+- MCP를 시작하면 get_workspace_catalog의 `relationship_graph`를 먼저 확인하세요. 각 edge는
+  어느 DB의 어떤 필드가 어느 DB로 이어지는지, 그리고 조인에 page ID·Notion user ID 중
+  무엇을 써야 하는지를 설명합니다.
+- query_database 결과의 각 `id`는 해당 DB 페이지 ID입니다. target DB의 relation 필드에
+  `contains` 필터로 이 ID를 넣어 역방향 조회할 수 있습니다. 한 DB의 relation 필드를
+  explore_pages로 정방향 탐색할 수도 있습니다.
+- `people` 속성은 relation과 다릅니다. People.Notion ID처럼 Notion 사용자 ID를 담는 필드와
+  Tasks.관련 인원처럼 사용자 ID를 받는 필드는 page ID가 아니라 Notion user ID로 조인하세요.
+- query_database로 반환된 페이지 ID는 같은 MCP 세션에서 fetch_page 또는 explore_pages로
+  바로 읽을 수 있습니다. 관계를 따라갈 때는 목록을 먼저 좁힌 뒤 본문을 읽으세요.
+
 [노션 - 활동 기록]
 
 1. 기업명/기술분류/분기/방법론 태그/규칙 종류처럼 "필드로 정확히 좁혀지는" 질문
@@ -49,9 +61,10 @@ USAGE_GUIDE = """\
       구체적 근거(문제 정의, 의사결정 이유, 인원별 역할 등)를 확인한 뒤 답하세요.
 
 2. "OO이 어떤 프로젝트 했어?", "OO 직책이 뭐야?" 같은 사람 중심 질문
-   -> query_database(database="people")로 사람 페이지를 찾고, 필요한 경우
-      explore_pages에서 참여 프로젝트 relation을 따라가세요. 전화번호·이메일 등
-      개인 연락처는 반환하지 않습니다.
+   -> query_database(database="people")로 사람 페이지를 찾으세요. 반환된 People 페이지
+      ID로 Projects.참여인원과 Projects.PM을 각각 조회하고, 반환된 Notion ID로
+      Tasks.관련 인원을 조회하세요. 그 뒤 각 프로젝트·회의록의 본문을 읽어 역할의 근거를
+      확인하세요. 전화번호·이메일 등 개인 연락처는 반환하지 않습니다.
 
 3. 여러 프로젝트/문서를 종합해야 하는 질문("보통 어떻게 하는지", "사례들을 종합하면")
    -> 1번으로 후보를 좁힌 뒤, 후보 각각에 fetch_page를 호출해 본문을 교차 확인하세요.
@@ -151,7 +164,7 @@ DATABASE_REGISTRY = {
 # raw sitemap: IDs/titles describe structure, while this catalog explains what
 # each area means and which structured filters are authoritative.
 WORKSPACE_CATALOG = {
-    "version": 1,
+    "version": 2,
     "overview": "Growth Hackers의 활동 기록은 Notion, 공식 사실/문서는 Google Drive에 있습니다.",
     "notion_databases": [
         {
@@ -168,9 +181,9 @@ WORKSPACE_CATALOG = {
         },
         {
             "name": "people",
-            "meaning": "회원의 소속팀, 직책, 기수와 참여 프로젝트 relation",
-            "use_for": ["사람의 조직 정보", "사람에서 프로젝트로 점프"],
-            "key_fields": ["소속팀", "직책", "기수", "참여 프로젝트", "Name"],
+            "meaning": "회원의 소속팀, 직책, 기수, 프로젝트 관계와 Notion 사용자 ID",
+            "use_for": ["사람의 조직 정보", "사람에서 프로젝트·회의록으로 점프"],
+            "key_fields": ["소속팀", "직책", "기수", "참여 프로젝트", "Notion ID", "Name"],
         },
         {
             "name": "tasks",
@@ -255,6 +268,70 @@ WORKSPACE_CATALOG = {
             "next": "query_database 또는 read_spreadsheet",
         },
     ],
+    "relationship_graph": [
+        {
+            "from": "people",
+            "from_field": "참여 프로젝트",
+            "to": "projects",
+            "to_field": "참여인원",
+            "join_key": "People page ID",
+            "direction": "people -> projects (direct relation); projects -> people (reverse filter)",
+            "purpose": "구성원과 프로젝트 참여 이력을 연결함",
+        },
+        {
+            "from": "people",
+            "from_field": "People page ID",
+            "to": "projects",
+            "to_field": "PM",
+            "join_key": "People page ID",
+            "direction": "projects -> people relation; filter Projects.PM by People page ID",
+            "purpose": "프로젝트의 PM·책임자 이력을 연결함",
+        },
+        {
+            "from": "people",
+            "from_field": "Notion ID",
+            "to": "tasks",
+            "to_field": "관련 인원",
+            "join_key": "Notion user ID",
+            "direction": "cross-type user identity join",
+            "purpose": "구성원과 참석·관련 회의록 및 업무를 연결함",
+            "filter_example": {"field": "관련 인원", "op": "contains", "value": "<People.Notion ID의 첫 값>"},
+        },
+        {
+            "from": "projects",
+            "from_field": "기업",
+            "to": "companies",
+            "to_field": "프로젝트",
+            "join_key": "Project page ID",
+            "direction": "bidirectional relation",
+            "purpose": "프로젝트와 협업 기업을 연결함",
+        },
+        {
+            "from": "tasks",
+            "from_field": "(DH) 기업",
+            "to": "companies",
+            "to_field": "프로젝트",
+            "join_key": "Company page ID",
+            "direction": "tasks -> companies relation",
+            "purpose": "대외협력 업무·계약 기록과 협업 기업을 연결함",
+        },
+        {
+            "from": "tasks",
+            "from_field": "선행 작업 / 후행 작업",
+            "to": "tasks",
+            "to_field": "id",
+            "join_key": "Task page ID",
+            "direction": "self relation",
+            "purpose": "업무·회의·일정의 의존 관계를 추적함",
+        },
+    ],
+    "multi_hop_query_pattern": [
+        "시작 DB에서 엔터티를 query_database로 찾고 결과 page ID와 사용자 ID 계열 필드를 보관한다.",
+        "relationship_graph에서 다음 edge의 join_key를 확인한다.",
+        "관계 필드면 explore_pages로 정방향 탐색하거나, 대상 DB에서 해당 relation field contains <page ID>로 역방향 조회한다.",
+        "people field면 대응되는 Notion user ID를 사용해 대상 DB에서 contains 필터로 조회한다.",
+        "각 단계에서 반환된 page ID를 fetch_page로 읽어, 속성만으로 확인되지 않는 역할·결정·근거를 검증한다.",
+    ],
     "tool_guidance": {
         "get_sitemap": "원시 구조·ID·부모 관계를 확인할 때만 사용",
         "describe_database": "카탈로그에 없는 최신 필드·옵션이 필요할 때 사용",
@@ -264,6 +341,7 @@ WORKSPACE_CATALOG = {
 }
 _schema_cache: dict[str, dict] = {}
 _notion_scope_cache: dict[str, dict] | None = None
+_known_notion_page_ids: set[str] = set()
 
 
 def _resolve_database(name: str) -> tuple[str, dict]:
@@ -364,6 +442,11 @@ def _get_notion_scope() -> dict[str, dict]:
 
 
 def _assert_notion_in_scope(page_id: str) -> None:
+    # A database query has already established that these pages belong to a
+    # registered GH database. Avoid rebuilding the entire Notion sitemap just
+    # to read a result returned in the same MCP session.
+    if page_id in _known_notion_page_ids:
+        return
     if page_id not in _get_notion_scope():
         raise ValueError("The requested Notion page is outside the Growth Hackers root")
 
@@ -510,13 +593,15 @@ def query_database(
     key, entry = _resolve_database(database)
     schema = _get_schema(key, entry)
     properties = schema.get("properties", {})
-    return notion.query_database(
+    rows = notion.query_database(
         entry["data_source_id"],
         filter_=_compile_filters(filters, properties),
         sorts=_compile_sorts(sorts, properties),
         page_size=min(max(page_size, 1), 100),
         max_rows=min(max(max_rows, 1), 5000),
     )
+    _known_notion_page_ids.update(row["id"] for row in rows if row.get("id"))
+    return rows
 
 
 @mcp.tool()
@@ -686,7 +771,10 @@ def _page_snapshot(
 ) -> tuple[dict, dict]:
     _assert_notion_in_scope(page_id)
     page = notion.get_page(page_id)
-    scoped = _get_notion_scope().get(page_id, {})
+    # `page_id` may be a result from query_database and is therefore already
+    # trusted. Do not trigger an expensive full sitemap walk merely to obtain
+    # optional title metadata.
+    scoped = (_notion_scope_cache or {}).get(page_id, {})
     body = ""
     if include_body or sections:
         body = notion.fetch_page_text(page_id, max_blocks=1000)
@@ -845,6 +933,7 @@ def search_notion_content(
             }
             for row in rows
         ]
+        _known_notion_page_ids.update(page["id"] for page in all_scope_pages if page.get("id"))
     else:
         all_scope_pages = [
             node for node in _get_notion_scope().values()
