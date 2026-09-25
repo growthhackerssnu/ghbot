@@ -24,7 +24,7 @@ python3 embed_index.py --upload-only
 
 `gh_bot.db` is only a local build/staging database now; the MCP server does not
 use it at runtime. The MCP server and sync worker require private
-`SUPABASE_KEY`; the `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` is not accepted for
+`SUPABASE_KEY` or `SUPABASE_SECRET_KEY`; the publishable key is not accepted for
 index access after RLS is enabled. Never commit any Supabase key.
 
 ### Daily sync

@@ -35,8 +35,14 @@ class SupabaseStore:
             or os.environ.get("SUPABASE_URL", "")
             or os.environ.get("NEXT_PUBLIC_SUPABASE_URL", "")
         ).rstrip("/")
-        self.private_key = key or os.environ.get("SUPABASE_KEY", "")
-        self.key = self.private_key or os.environ.get("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY", "")
+        self.private_key = (
+            key
+            or os.environ.get("SUPABASE_KEY", "")
+            or os.environ.get("SUPABASE_SECRET_KEY", "")
+        )
+        self.key = self.private_key or os.environ.get("SUPABASE_PUBLISHABLE_KEY", "") or os.environ.get(
+            "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY", ""
+        )
 
     @property
     def enabled(self) -> bool:

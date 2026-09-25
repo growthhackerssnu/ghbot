@@ -199,7 +199,7 @@ WORKSPACE_CATALOG = {
                     ]},
                 ]},
             ],
-            "hints": ["법인", "정관", "조직", "의사결정", "전체 운영"],
+            "hints": ["법인", "정관", "조직", "의사결정", "전체 운영", "출석", "벌점"],
         },
         {
             "name": "DH",
@@ -213,15 +213,15 @@ WORKSPACE_CATALOG = {
             "name": "NUT",
             "meaning": "내부 운영, 총무, 예산, 법인화와 정관 관련 공식 운영 자료",
             "drive_team": "NUT",
-            "hints": ["예산", "정관", "법인", "총무", "내부 운영"],
+            "hints": ["예산", "정관", "법인", "총무", "내부 운영", "멘멘", "MT"],
         },
         {
             "name": "HR",
-            "meaning": "리크루팅, 인사, 출석, 벌점, 알럼나이",
+            "meaning": "리크루팅, 인사, 알럼나이",
             "scope_database": "tasks",
             "scope_filters": [{"field": "담당부서", "op": "contains", "value": "HR"}],
             "drive_team": "HR",
-            "hints": ["리크루팅", "면접", "출석", "벌점", "알럼나이"],
+            "hints": ["리크루팅", "면접", "알럼나이", "퀘스트"],
         },
         {
             "name": "PR",
@@ -250,7 +250,7 @@ WORKSPACE_CATALOG = {
             "next": "search_notion_content와 search_drive를 둘 다 고려",
         },
         {
-            "intent": ["리크루팅", "면접", "출석", "알럼나이"],
+            "intent": ["리크루팅", "면접", "알럼나이"],
             "scopes": ["HR", "PR"],
             "next": "query_database 또는 read_spreadsheet",
         },
