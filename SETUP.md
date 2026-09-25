@@ -86,4 +86,5 @@ Cron schedule: 0 18 * * *  # UTC 18:00 = 한국시간 03:00
 
 Cron 서비스에도 Notion, Google Drive, Supabase 관련 환경변수를 동일하게
 복사해야 합니다. 이 작업은 Supabase의 기존 인덱스를 staging DB에 복원한
-뒤 변경된 문서만 다시 가져와서 Supabase에 게시하고 종료합니다.
+뒤 변경된 프로젝트·Tasks 회의록·Drive 문서만 다시 가져와서 Supabase에 게시하고 종료합니다.
+People DB는 개인정보가 임베딩에 들어가지 않도록 동기화 대상에서 제외합니다.

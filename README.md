@@ -31,7 +31,7 @@ index access after RLS is enabled. Never commit any Supabase key.
 
 The repository includes [`sync_worker.py`](sync_worker.py), a short-lived job
 that hydrates the staging index from Supabase, incrementally fetches changed
-Notion/Drive documents, publishes the result, and exits. Create a separate
+Notion project pages, Tasks/meeting notes, and Drive documents, publishes the result, and exits. Create a separate
 Railway service from this repository for the worker; keep the existing web
 service on `railway.json`. Use [`railway.sync.json`](railway.sync.json) as the
 worker service configuration, or set these values in Railway's service
