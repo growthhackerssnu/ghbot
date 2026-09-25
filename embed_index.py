@@ -38,7 +38,12 @@ NOTION_SOURCES = [
     {"label": "진행중_프로젝트(Projects)", "data_source_id": PROJECTS_DB_ID, "title_prop": "Name"},
     # Tasks contains meeting notes and operating decisions. People DB is
     # intentionally excluded so personal contact fields never enter the index.
-    {"label": "운영업무_회의록(Tasks)", "data_source_id": TASKS_DB_ID, "title_prop": "Name"},
+    {
+        "label": "운영업무_회의록(Tasks)",
+        "data_source_id": TASKS_DB_ID,
+        "title_prop": "Name",
+        "filter": {"property": "종류", "select": {"equals": "회의"}},
+    },
 ]
 
 MAX_CHUNK_CHARS = 800
@@ -253,7 +258,12 @@ def index_notion(indexer: Indexer, notion: NotionClient):
         label = source["label"]
         indexer.seen_this_run.setdefault(label, set())
         try:
-            rows = notion.query_database(source["data_source_id"], page_size=100, max_rows=5000)
+            rows = notion.query_database(
+                source["data_source_id"],
+                filter_=source.get("filter"),
+                page_size=100,
+                max_rows=5000,
+            )
         except NotionAccessError as e:
             print(f"[skip] {label}: not accessible yet - {e}")
             continue
