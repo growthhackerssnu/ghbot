@@ -45,4 +45,3 @@ create table if not exists public.ghbot_notion_content (
 
 create index if not exists ghbot_notion_content_title_idx
     on public.ghbot_notion_content (title);
-

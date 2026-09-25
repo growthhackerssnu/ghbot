@@ -1,4 +1,9 @@
-"""Builds/updates the SQLite semantic index for content that needs context
+"""Builds/updates the SQLite staging index and publishes it to Supabase.
+
+The MCP server reads Supabase directly. This file remains the incremental
+builder used by the daily sync job and by local one-off rebuilds.
+
+Builds/updates the SQLite semantic index for content that needs context
 search rather than exact-field filtering (meeting notes, deliberation-heavy
 docs, official Drive documents). Run manually or on a schedule:
 `python embed_index.py`.
@@ -9,17 +14,19 @@ changed since the last run - unchanged documents are skipped, which matters
 once meeting notes / more Drive folders push this into the hundreds+ range.
 Pass --full to force a full rebuild (drops both tables first).
 """
+from __future__ import annotations
+
 import sys
 import sqlite3
 from pathlib import Path
 
-from dotenv import load_dotenv
-from fastembed import TextEmbedding
+import numpy as np
 
-from notion_client import NotionClient, NotionAccessError, ARCHIVE_DB_ID, PROJECTS_DB_ID
-from drive_client import DriveClient, TEAM_FOLDERS
+from notion_client import NotionClient, NotionAccessError, PROJECTS_DB_ID
+from config import load_env_file
+from supabase_store import SupabaseStore
 
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+load_env_file(Path(__file__).parent / ".env")
 
 DB_PATH = Path(__file__).parent / "gh_bot.db"
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -28,13 +35,117 @@ MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 # Add a data_source_id here once its database is shared with the integration
 # ("..." -> Connections -> ghbot 연결 in Notion).
 NOTION_SOURCES = [
-    {"label": "프로젝트_백서(Archive)", "data_source_id": ARCHIVE_DB_ID, "title_prop": "Task name"},
     {"label": "진행중_프로젝트(Projects)", "data_source_id": PROJECTS_DB_ID, "title_prop": "Name"},
     # {"label": "운영진_회의록", "data_source_id": "<fill in once shared>", "title_prop": "Name"},
     # {"label": "회장단_회의록", "data_source_id": "<fill in once shared>", "title_prop": "Name"},
 ]
 
 MAX_CHUNK_CHARS = 800
+
+
+def _batches(rows, size=200):
+    for start in range(0, len(rows), size):
+        yield rows[start:start + size]
+
+
+def publish_sqlite_index(conn, store: SupabaseStore) -> None:
+    """Publish the local build result into the canonical Supabase tables."""
+    store.require_enabled()
+
+    chunk_rows = []
+    for row in conn.execute(
+        "SELECT page_id, chunk_index, url, title, source_label, chunk_text, embedding, last_edited FROM chunks"
+    ):
+        page_id, chunk_index, url, title, source_label, chunk_text, embedding, last_edited = row
+        chunk_rows.append({
+            "page_id": page_id,
+            "chunk_index": chunk_index,
+            "url": url,
+            "title": title,
+            "source_label": source_label,
+            "chunk_text": chunk_text,
+            "embedding": np.frombuffer(embedding, dtype="float32").tolist(),
+            "last_edited": last_edited,
+        })
+    # A changed document can produce fewer chunks than before. Clear that
+    # document's remote chunks first so old chunk indexes cannot survive an
+    # upsert and pollute later searches.
+    for page_id in {row["page_id"] for row in chunk_rows}:
+        store.delete("ghbot_chunks", [("page_id", f"eq.{page_id}")])
+    for batch in _batches(chunk_rows):
+        store.upsert("ghbot_chunks", batch, on_conflict="page_id,chunk_index")
+
+    page_rows = [
+        {"page_id": page_id, "source_label": source_label, "last_edited_time": edited}
+        for page_id, source_label, edited in conn.execute(
+            "SELECT page_id, source_label, last_edited_time FROM pages"
+        )
+    ]
+    for batch in _batches(page_rows):
+        store.upsert("ghbot_pages", batch, on_conflict="page_id")
+
+    drive_rows = []
+    try:
+        drive_rows = [
+            {"file_id": file_id, "team": team}
+            for file_id, team in conn.execute("SELECT file_id, team FROM drive_files")
+        ]
+    except sqlite3.OperationalError:
+        pass
+    for batch in _batches(drive_rows):
+        store.upsert("ghbot_drive_files", batch, on_conflict="file_id")
+
+    # Remove rows deleted by the local sweep so the remote table does not keep
+    # returning stale documents. This is intentionally done by primary key
+    # rather than a broad DELETE, which makes partial indexes safer to publish.
+    local_page_ids = {row["page_id"] for row in page_rows}
+    for remote in store.select_all("ghbot_pages", columns="page_id"):
+        if remote["page_id"] not in local_page_ids:
+            page_id = remote["page_id"]
+            store.delete("ghbot_chunks", [("page_id", f"eq.{page_id}")])
+            store.delete("ghbot_pages", [("page_id", f"eq.{page_id}")])
+
+    print(f"published {len(chunk_rows)} chunks to Supabase")
+
+
+def hydrate_staging_index(conn, store: SupabaseStore) -> None:
+    """Restore the last published index into the ephemeral worker filesystem."""
+    pages = store.select_all("ghbot_pages")
+    chunks = store.select_all("ghbot_chunks")
+    drive_files = store.select_all("ghbot_drive_files")
+
+    conn.execute("DELETE FROM chunks")
+    conn.execute("DELETE FROM pages")
+    conn.execute("CREATE TABLE IF NOT EXISTS drive_files (file_id TEXT PRIMARY KEY, team TEXT)")
+    conn.execute("DELETE FROM drive_files")
+    conn.executemany(
+        "INSERT INTO pages(page_id, source_label, last_edited_time) VALUES (?, ?, ?)",
+        [(row["page_id"], row.get("source_label", ""), row.get("last_edited_time")) for row in pages],
+    )
+    conn.executemany(
+        """INSERT INTO chunks(
+            page_id, url, title, source_label, chunk_index, chunk_text, embedding, last_edited
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                row["page_id"],
+                row.get("url"),
+                row.get("title"),
+                row.get("source_label", ""),
+                row["chunk_index"],
+                row.get("chunk_text", ""),
+                sqlite3.Binary(np.asarray(row.get("embedding") or [], dtype="float32").tobytes()),
+                row.get("last_edited"),
+            )
+            for row in chunks
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO drive_files(file_id, team) VALUES (?, ?)",
+        [(row["file_id"], row.get("team", "")) for row in drive_files],
+    )
+    conn.commit()
+    print(f"hydrated staging index from Supabase: {len(pages)} pages, {len(chunks)} chunks")
 
 
 def chunk_text(text: str) -> list[str]:
@@ -190,12 +301,20 @@ def index_drive(indexer: Indexer, drive: DriveClient):
     indexer.conn.commit()
 
 
-def main():
-    full_rebuild = "--full" in sys.argv
-    skip_notion = "--drive-only" in sys.argv
-    skip_drive = "--notion-only" in sys.argv
-
+def run(
+    *,
+    full_rebuild: bool = False,
+    upload_only: bool = False,
+    skip_notion: bool = False,
+    skip_drive: bool = False,
+):
+    """Run one incremental build and publish pass."""
     conn = sqlite3.connect(DB_PATH)
+    store = SupabaseStore()
+    if upload_only:
+        publish_sqlite_index(conn, store)
+        conn.close()
+        return {"published": True, "upload_only": True, "db_path": str(DB_PATH)}
     if full_rebuild:
         conn.execute("DROP TABLE IF EXISTS chunks")
         conn.execute("DROP TABLE IF EXISTS pages")
@@ -228,6 +347,11 @@ def main():
         """
     )
     conn.commit()
+    if store.enabled and not full_rebuild:
+        hydrate_staging_index(conn, store)
+
+    from fastembed import TextEmbedding
+    from drive_client import DriveClient
 
     model = TextEmbedding(model_name=MODEL_NAME)
     indexer = Indexer(conn, model)
@@ -239,9 +363,33 @@ def main():
 
     removed = indexer.sweep_removed()
     total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    if store.enabled:
+        publish_sqlite_index(conn, store)
+    else:
+        print("warning: SUPABASE_URL/SUPABASE_KEY not set; index was only written locally")
+    summary = {
+        "updated": indexer.updated,
+        "unchanged": indexer.unchanged,
+        "skipped": indexer.skipped,
+        "removed": removed,
+        "total_chunks": total_chunks,
+        "db_path": str(DB_PATH),
+        "published": store.enabled,
+    }
     print(
         f"done - {indexer.updated} updated, {indexer.unchanged} unchanged (skipped re-embed), "
         f"{indexer.skipped} skipped (error/empty), {removed} removed - {total_chunks} chunks total in {DB_PATH}"
+    )
+    conn.close()
+    return summary
+
+
+def main():
+    run(
+        full_rebuild="--full" in sys.argv,
+        upload_only="--upload-only" in sys.argv,
+        skip_notion="--drive-only" in sys.argv,
+        skip_drive="--notion-only" in sys.argv,
     )
 
 

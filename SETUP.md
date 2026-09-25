@@ -2,8 +2,8 @@
 
 ## 포함된 것 / 빠진 것
 - `server.py`, `notion_client.py`, `embed_index.py`, `requirements.txt` - 서버 코드
-- `gh_bot.db` - 이미 만들어진 임베딩 인덱스 (135페이지·2,497청크). 그대로 쓰면 되고,
-  새로 인덱싱하고 싶을 때만 `embed_index.py`를 다시 돌리면 됩니다.
+- `gh_bot.db` - 임베딩을 만들기 위한 로컬 staging DB. MCP 서버 실행 시에는
+  읽지 않고 Supabase Postgres 테이블을 직접 조회합니다.
 - `.env`는 **일부러 안 넣었습니다** - Notion Integration Secret이라 파일로 옮기지 않고
   아래에서 직접 붙여넣게 했습니다.
 
@@ -14,13 +14,20 @@ pip install -r requirements.txt
 ```
 
 ## 2. 시크릿 설정
-`.env.example`을 `.env`로 복사하고, 안의 값을 실제 Notion Integration Secret으로 바꾸세요.
+`.env.example`을 `.env`로 복사하고, Notion/Supabase 값을 실제 값으로 바꾸세요.
 ```bash
 cp .env.example .env
 ```
 Secret은 기존 노트북의 `.env` 파일에서 그대로 복사해오거나, Notion에서
 [my-integrations](https://www.notion.so/my-integrations)에 들어가 같은 Integration(`ghbot 연결`)의
 시크릿을 다시 확인하면 됩니다.
+
+Supabase에서는 먼저 `supabase_schema.sql`을 SQL Editor에서 실행하세요.
+그 다음 `SUPABASE_URL`과 private backend/service-role 성격의 `SUPABASE_KEY`를
+설정합니다. 이 키는 서버 전용이므로 클라이언트나 저장소에 노출하면 안 됩니다.
+기존 프로젝트의 `NEXT_PUBLIC_SUPABASE_URL`은 URL로도 인식되지만,
+`NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`는 읽기 전용 확인용으로만 두고
+인덱스 게시에는 private key를 사용하세요.
 
 ## 3. 동작 확인
 ```bash
@@ -53,9 +60,29 @@ startup_timeout_sec = 30
 
 등록 후 해당 앱을 완전히 재시작해야 반영됩니다.
 
-## 5. (선택) 인덱스 새로 만들기
+## 5. 기존 인덱스 게시 또는 새로 만들기
+
+이미 있는 `gh_bot.db`를 Supabase에 올리려면:
+
+```bash
+python3 embed_index.py --upload-only
+```
+
 노션 내용이 많이 바뀌었으면:
 ```bash
-python embed_index.py
+python3 embed_index.py
 ```
-`gh_bot.db`를 통째로 재생성합니다 (수 분 소요, 네트워크 필요).
+인덱싱이 끝나면 Supabase 테이블에도 자동 게시됩니다 (수 분 소요, 네트워크 필요).
+
+운영 환경에서는 기존 MCP 웹 서비스와 별도로 Railway Cron 서비스를 하나
+추가하세요. 이 저장소의 `railway.sync.json`을 설정 파일로 사용하거나 Railway
+서비스 설정에 다음을 입력합니다:
+
+```text
+Start command: python sync_worker.py
+Cron schedule: 0 18 * * *  # UTC 18:00 = 한국시간 03:00
+```
+
+Cron 서비스에도 Notion, Google Drive, Supabase 관련 환경변수를 동일하게
+복사해야 합니다. 이 작업은 Supabase의 기존 인덱스를 staging DB에 복원한
+뒤 변경된 문서만 다시 가져와서 Supabase에 게시하고 종료합니다.
