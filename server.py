@@ -14,6 +14,7 @@ from notion_client import (
     PROJECTS_DB_ID,
     COMPANIES_DB_ID,
     GUIDES_DB_ID,
+    INSIGHTS_DB_ID,
     PEOPLE_DB_ID,
     TASKS_DB_ID,
 )
@@ -160,10 +161,13 @@ DATABASE_REGISTRY = {
     },
 }
 
-# These databases are the public navigation/search surface of ghbot.  The
-# Notion root contains other databases too, but keeping the scope explicit
-# prevents an unrelated workspace area from silently becoming searchable.
-OFFICIAL_DATABASE_IDS = {entry["database_id"] for entry in DATABASE_REGISTRY.values()}
+# These are the top-level navigation/search surface of ghbot. Insights is
+# project-scoped: users reach it through a specific project rather than an
+# unrelated top-level knowledge area.
+CORE_SITEMAP_DATABASES = {"people", "projects", "companies", "tasks", "guides"}
+OFFICIAL_DATABASE_IDS = {
+    DATABASE_REGISTRY[key]["database_id"] for key in CORE_SITEMAP_DATABASES
+}
 
 # A People row is useful for structured routing, but its page body can contain
 # personal information.  Do not place it in the general full-text cache.
@@ -206,6 +210,14 @@ WORKSPACE_CATALOG = {
             "meaning": "안내서, 규칙, 인수인계, 계획서, 템플릿과 아카이빙 문서",
             "use_for": ["운영 방법", "규칙·내규", "팀 인수인계", "템플릿"],
             "key_fields": ["종류", "태그", "상태", "운영 기수", "Name"],
+        },
+    ],
+    "project_scoped_databases": [
+        {
+            "name": "insights",
+            "meaning": "각 프로젝트에 연결된 성공·실패 인사이트와 한줄 요약",
+            "access": "get_project_insights(project_id) 또는 Insights.연관 프로젝트 relation 역조회",
+            "key_fields": ["인사이트 타입", "인사이트 분야", "연관 프로젝트", "인사이트 한줄요약", "Name"],
         },
     ],
     "domains": [
@@ -315,6 +327,15 @@ WORKSPACE_CATALOG = {
             "join_key": "Project page ID",
             "direction": "bidirectional relation",
             "purpose": "프로젝트와 협업 기업을 연결함",
+        },
+        {
+            "from": "projects",
+            "from_field": "id",
+            "to": "insights",
+            "to_field": "연관 프로젝트",
+            "join_key": "Project page ID",
+            "direction": "projects -> insights reverse relation filter",
+            "purpose": "프로젝트의 성공·실패 인사이트와 재사용 가능한 교훈을 연결함",
         },
         {
             "from": "tasks",
@@ -633,7 +654,7 @@ def get_sitemap(
     include_schema: bool = False,
     include_files: bool = False,
 ) -> dict:
-    """Return a lightweight inventory of the five supported GH databases and Drive."""
+    """Return a lightweight inventory of the supported GH databases and Drive."""
     if source not in ("all", "notion", "drive"):
         raise ValueError("source must be all, notion, or drive")
     result: dict = {}
@@ -701,7 +722,6 @@ def list_pages(
     cursor; for a normal Notion page, it lists child blocks.
     """
     if source == "notion":
-        _assert_notion_in_scope(parent_id)
         database = next(
             ((key, entry) for key, entry in DATABASE_REGISTRY.items() if entry["database_id"] == parent_id),
             None,
@@ -722,6 +742,7 @@ def list_pages(
                 "results": rows,
                 "next_cursor": result["next_cursor"],
             }
+        _assert_notion_in_scope(parent_id)
         return {
             "source": "notion",
             "parent_id": parent_id,
@@ -761,6 +782,28 @@ def fetch_page(page_id: str) -> str:
     """Fetch a Notion page's body as plain text, for reading a specific whitepaper/meeting note in full."""
     _assert_notion_in_scope(page_id)
     return notion.fetch_page_text(page_id)
+
+
+@mcp.tool()
+def get_project_insights(project_id: str) -> list[dict]:
+    """Return the success/failure insights linked to one Projects page.
+
+    Insights is project-scoped rather than a top-level sitemap area.  Start by
+    finding a project with query_database or list_pages, then pass its page ID.
+    """
+    # This is intentionally a project-only route: Insights is a root-level
+    # Notion database operationally, but its rows are meaningful only via the
+    # `연관 프로젝트` relation. Do not expose it as a global browse/search DB.
+    project = _get_notion_scope().get(project_id)
+    if not project or (project.get("parent") or {}).get("database_id") != DATABASE_REGISTRY["projects"]["database_id"]:
+        raise ValueError("project_id must be a page in the Projects database")
+    rows = notion.query_database(
+        INSIGHTS_DB_ID,
+        filter_={"property": "연관 프로젝트", "relation": {"contains": project_id}},
+        max_rows=100,
+    )
+    _known_notion_page_ids.update(row["id"] for row in rows if row.get("id"))
+    return rows
 
 
 def _page_title(page: dict, scoped: dict | None = None) -> str:
@@ -807,6 +850,28 @@ def _extract_sections(text: str, requested: list[str]) -> dict[str, str]:
         for name in matches:
             found[name] = section
     return found
+
+
+def _strip_named_sections(text: str, section_names: list[str]) -> str:
+    """Remove complete Markdown sections before a broad body-cache search."""
+    if not section_names:
+        return text
+    blocked = {name.casefold() for name in section_names}
+    kept: list[str] = []
+    skip_level: int | None = None
+    for line in text.splitlines():
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            level = len(match.group(1))
+            title = match.group(2).strip().casefold()
+            if title in blocked:
+                skip_level = level
+                continue
+            if skip_level is not None and level <= skip_level:
+                skip_level = None
+        if skip_level is None:
+            kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def _page_snapshot(
@@ -1022,6 +1087,15 @@ def search_notion_content(
     )
     scope_by_id = {node["id"]: node for node in scope_pages}
 
+    # A content-policy revision is part of the cache marker.  It makes older
+    # project bodies (which may contain retrospective/letter sections) stale
+    # and prevents them from being returned while the safe body is refreshed.
+    def cache_marker(node: dict) -> str:
+        revision = "|project-body-safe-v1" if (node.get("parent") or {}).get("database_id") == DATABASE_REGISTRY["projects"]["database_id"] else ""
+        return f"{node.get('last_edited_time') or ''}{revision}"
+
+    expected_markers = {page_id: cache_marker(node) for page_id, node in scope_by_id.items()}
+
     supabase.require_private()
     cached_rows = supabase.select_all("ghbot_notion_content")
     cached = {row["page_id"]: row.get("last_edited_time") for row in cached_rows}
@@ -1030,7 +1104,7 @@ def search_notion_content(
     complete = True
     for node in scope_pages:
         page_id = node["id"]
-        current_edit = node.get("last_edited_time")
+        current_edit = cache_marker(node)
         if not refresh and page_id in cached and cached[page_id] == current_edit:
             continue
         if scan_budget_seconds and time.monotonic() - started >= scan_budget_seconds:
@@ -1038,6 +1112,8 @@ def search_notion_content(
             break
         try:
             body = notion.fetch_page_text(page_id, max_blocks=1000)
+            if (node.get("parent") or {}).get("database_id") == DATABASE_REGISTRY["projects"]["database_id"]:
+                body = _strip_named_sections(body, ["개인별 회고", "편지"])
         except (NotionAccessError, RuntimeError):
             scanned_this_call += 1
             continue
@@ -1063,7 +1139,7 @@ def search_notion_content(
         # A scoped interactive search may update only a small slice of the
         # cache.  Keep other slices for reuse, but never let them leak into
         # this query's result set.
-        if page_id not in scope_by_id:
+        if page_id not in scope_by_id or row.get("last_edited_time") != expected_markers[page_id]:
             continue
         title = row.get("title") or ""
         body = row.get("body") or ""
@@ -1082,7 +1158,7 @@ def search_notion_content(
             "match": "title_and_body" if phrase_in_title and phrase_in_body else "title" if phrase_in_title else "body",
             "snippet": _content_snippet(title, body, query),
             "score": score,
-            "last_edited_time": row.get("last_edited_time"),
+            "last_edited_time": scope_by_id[page_id].get("last_edited_time"),
         })
     return {
         "results": sorted(matches, key=lambda item: (-item["score"], item["title"] or ""))[:max_results],

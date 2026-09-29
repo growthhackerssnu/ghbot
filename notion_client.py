@@ -27,6 +27,7 @@ TASKS_DB_ID = "3ae40bd1-0676-80ff-8782-000b9897f7ec"
 # Historical archive (GH_Project_ARCHIVE Mainpage) and rules/templates (root hub).
 ARCHIVE_DB_ID = "345138fb-f14f-4bd9-8801-bcb2cfd21dad"
 GUIDES_DB_ID = "3b140bd1-0676-80ea-91a0-000b4e171b68"
+INSIGHTS_DB_ID = "3b940bd1-0676-8084-8b67-000b6f1bd4a5"
 
 
 class NotionAccessError(RuntimeError):

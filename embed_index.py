@@ -17,6 +17,7 @@ Pass --full to force a full rebuild (drops both tables first).
 """
 from __future__ import annotations
 
+import re
 import sys
 import sqlite3
 from pathlib import Path
@@ -36,7 +37,12 @@ MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 # Add a data_source_id here once its database is shared with the integration
 # ("..." -> Connections -> ghbot 연결 in Notion).
 NOTION_SOURCES = [
-    {"label": "진행중_프로젝트(Projects)", "data_source_id": PROJECTS_DB_ID, "title_prop": "Name"},
+    {
+        "label": "진행중_프로젝트(Projects, safe sections)",
+        "data_source_id": PROJECTS_DB_ID,
+        "title_prop": "Name",
+        "strip_sections": ["개인별 회고", "편지"],
+    },
     # Tasks contains meeting notes and operating decisions. People DB is
     # intentionally excluded so personal contact fields never enter the index.
     {
@@ -48,6 +54,29 @@ NOTION_SOURCES = [
 ]
 
 MAX_CHUNK_CHARS = 800
+
+
+def strip_named_sections(text: str, section_names: list[str]) -> str:
+    """Remove whole markdown sections such as project retrospectives/letters."""
+    if not section_names:
+        return text
+    blocked = {name.casefold() for name in section_names}
+    lines = text.splitlines()
+    kept: list[str] = []
+    skip_level: int | None = None
+    for line in lines:
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if heading:
+            level = len(heading.group(1))
+            title = heading.group(2).casefold()
+            if title in blocked:
+                skip_level = level
+                continue
+            if skip_level is not None and level <= skip_level:
+                skip_level = None
+        if skip_level is None:
+            kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def _batches(rows, size=200):
@@ -214,9 +243,9 @@ class Indexer:
         self.seen_this_run.setdefault(label, set()).add(doc_id)
 
         prev = self.conn.execute(
-            "SELECT last_edited_time FROM pages WHERE page_id = ?", (doc_id,)
+            "SELECT source_label, last_edited_time FROM pages WHERE page_id = ?", (doc_id,)
         ).fetchone()
-        if prev and prev[0] == edited:
+        if prev and prev[0] == label and prev[1] == edited:
             self.unchanged += 1
             return
 
@@ -291,9 +320,12 @@ def index_notion(indexer: Indexer, notion: NotionClient):
         for row in rows:
             title = row.get(source["title_prop"], "") or "(untitled)"
             page_id = row["id"]
+            strip_sections = source.get("strip_sections", [])
             indexer.index_document(
                 page_id, row.get("url"), title, label, row.get("last_edited_time"),
-                lambda pid=page_id: notion.fetch_page_text(pid, max_blocks=1000),
+                lambda pid=page_id, sections=strip_sections: strip_named_sections(
+                    notion.fetch_page_text(pid, max_blocks=1000), sections
+                ),
             )
 
 
