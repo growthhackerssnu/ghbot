@@ -3,9 +3,10 @@
 The MCP server reads Supabase directly. This file remains the incremental
 builder used by the daily sync job and by local one-off rebuilds.
 
-Builds/updates the SQLite semantic index for content that needs context
-search rather than exact-field filtering (meeting notes, deliberation-heavy
-docs, official Drive documents). Run manually or on a schedule:
+Builds/updates the SQLite semantic index for Notion content that needs context
+search rather than exact-field filtering (project pages and meeting notes).
+Drive remains a live, metadata-first source and is not embedded. Run manually
+or on a schedule:
 `python embed_index.py`.
 
 Incremental: each document's last_edited timestamp is tracked in the `pages`
@@ -54,6 +55,28 @@ def _batches(rows, size=200):
         yield rows[start:start + size]
 
 
+DRIVE_SOURCE_PREFIX = "구글드라이브_"
+
+
+def purge_drive_index(conn) -> None:
+    """Remove legacy Drive embeddings from the local staging index.
+
+    Drive is searched live by team/path/name/content instead of semantic
+    retrieval, so retaining its old chunks would only dilute Notion results.
+    """
+    for table, statement, params in (
+        ("chunks", "DELETE FROM chunks WHERE source_label LIKE ?", (f"{DRIVE_SOURCE_PREFIX}%",)),
+        ("pages", "DELETE FROM pages WHERE source_label LIKE ?", (f"{DRIVE_SOURCE_PREFIX}%",)),
+        ("drive_files", "DELETE FROM drive_files", ()),
+    ):
+        try:
+            conn.execute(statement, params)
+        except sqlite3.OperationalError as exc:
+            if f"no such table: {table}" not in str(exc):
+                raise
+    conn.commit()
+
+
 def publish_sqlite_index(conn, store: SupabaseStore) -> None:
     """Publish the local build result into the canonical Supabase tables."""
     store.require_write_enabled()
@@ -90,16 +113,9 @@ def publish_sqlite_index(conn, store: SupabaseStore) -> None:
     for batch in _batches(page_rows):
         store.upsert("ghbot_pages", batch, on_conflict="page_id")
 
-    drive_rows = []
-    try:
-        drive_rows = [
-            {"file_id": file_id, "team": team}
-            for file_id, team in conn.execute("SELECT file_id, team FROM drive_files")
-        ]
-    except sqlite3.OperationalError:
-        pass
-    for batch in _batches(drive_rows):
-        store.upsert("ghbot_drive_files", batch, on_conflict="file_id")
+    # Drive is deliberately not indexed.  Clear the legacy lookup table so
+    # search_drive falls back to its live path-based team filter.
+    store.delete("ghbot_drive_files", [("file_id", "not.is.null")])
 
     # Remove rows deleted by the local sweep so the remote table does not keep
     # returning stale documents. This is intentionally done by primary key
@@ -118,12 +134,9 @@ def hydrate_staging_index(conn, store: SupabaseStore) -> None:
     """Restore the last published index into the ephemeral worker filesystem."""
     pages = store.select_all("ghbot_pages")
     chunks = store.select_all("ghbot_chunks")
-    drive_files = store.select_all("ghbot_drive_files")
 
     conn.execute("DELETE FROM chunks")
     conn.execute("DELETE FROM pages")
-    conn.execute("CREATE TABLE IF NOT EXISTS drive_files (file_id TEXT PRIMARY KEY, team TEXT)")
-    conn.execute("DELETE FROM drive_files")
     conn.executemany(
         "INSERT INTO pages(page_id, source_label, last_edited_time) VALUES (?, ?, ?)",
         [(row["page_id"], row.get("source_label", ""), row.get("last_edited_time")) for row in pages],
@@ -145,10 +158,6 @@ def hydrate_staging_index(conn, store: SupabaseStore) -> None:
             )
             for row in chunks
         ],
-    )
-    conn.executemany(
-        "INSERT INTO drive_files(file_id, team) VALUES (?, ?)",
-        [(row["file_id"], row.get("team", "")) for row in drive_files],
     )
     conn.commit()
     print(f"hydrated staging index from Supabase: {len(pages)} pages, {len(chunks)} chunks")
@@ -288,58 +297,17 @@ def index_notion(indexer: Indexer, notion: NotionClient):
             )
 
 
-def index_drive(indexer: Indexer, drive: DriveClient):
-    # file_id -> team, so search_drive(team=...) can do a fast local lookup
-    # instead of a live recursive Drive folder walk. Resolved from one bulk
-    # listing (list_all_files -> resolve_file_teams) instead of one API call
-    # per folder, which is what made the earlier version take minutes.
-    indexer.conn.execute(
-        "CREATE TABLE IF NOT EXISTS drive_files (file_id TEXT PRIMARY KEY, team TEXT)"
-    )
-    print("[drive] listing all files...")
-    all_files = drive.list_all_files()
-    file_team, by_id = drive.resolve_file_teams(all_files)
-    print(f"[drive] {len(all_files)} items total, {len(file_team)} resolved to a team")
-
-    by_team: dict[str, list[dict]] = {}
-    for file_id, team in file_team.items():
-        by_team.setdefault(team, []).append(by_id[file_id])
-
-    # The bulk Drive listing completed successfully, so an empty team is
-    # meaningful and old rows for it may be swept.  If listing fails above,
-    # this block is never reached and the previous index is preserved.
-    for team in TEAM_FOLDERS:
-        label = f"구글드라이브_{team}"
-        indexer.seen_this_run.setdefault(label, set())
-        indexer.mark_enumerated(label)
-
-    for team, files in by_team.items():
-        label = f"구글드라이브_{team}"
-        print(f"[{label}] {len(files)} files found")
-        for f in files:
-            indexer.conn.execute(
-                "INSERT INTO drive_files (file_id, team) VALUES (?, ?) "
-                "ON CONFLICT(file_id) DO UPDATE SET team = excluded.team",
-                (f["id"], team),
-            )
-            indexer.index_document(
-                f["id"], f.get("webViewLink"), f["name"], label, f.get("modifiedTime"),
-                lambda fid=f["id"], mt=f["mimeType"]: drive.read_file_text(fid, mt),
-            )
-    indexer.conn.commit()
-
-
 def run(
     *,
     full_rebuild: bool = False,
     upload_only: bool = False,
     skip_notion: bool = False,
-    skip_drive: bool = False,
 ):
     """Run one incremental build and publish pass."""
     conn = sqlite3.connect(DB_PATH)
     store = SupabaseStore()
     if upload_only:
+        purge_drive_index(conn)
         publish_sqlite_index(conn, store)
         conn.close()
         return {"published": True, "upload_only": True, "db_path": str(DB_PATH)}
@@ -378,16 +346,17 @@ def run(
     if store.private_enabled and not full_rebuild:
         hydrate_staging_index(conn, store)
 
+    # Hydration may restore legacy Drive chunks.  Remove them before either
+    # building or publishing so the next successful sync cleans Supabase too.
+    purge_drive_index(conn)
+
     from fastembed import TextEmbedding
-    from drive_client import DriveClient
 
     model = TextEmbedding(model_name=MODEL_NAME)
     indexer = Indexer(conn, model)
 
     if not skip_notion:
         index_notion(indexer, NotionClient())
-    if not skip_drive:
-        index_drive(indexer, DriveClient())
 
     removed = indexer.sweep_removed()
     total_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
@@ -403,6 +372,7 @@ def run(
         "total_chunks": total_chunks,
         "db_path": str(DB_PATH),
         "published": store.private_enabled,
+        "drive_embedded": False,
     }
     print(
         f"done - {indexer.updated} updated, {indexer.unchanged} unchanged (skipped re-embed), "
@@ -416,8 +386,6 @@ def main():
     run(
         full_rebuild="--full" in sys.argv,
         upload_only="--upload-only" in sys.argv,
-        skip_notion="--drive-only" in sys.argv,
-        skip_drive="--notion-only" in sys.argv,
     )
 
 

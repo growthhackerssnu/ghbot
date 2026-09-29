@@ -1,4 +1,4 @@
-"""One-shot Notion/Drive -> Supabase sync worker.
+"""One-shot Notion -> Supabase semantic-index sync worker.
 
 This process is intentionally short-lived so it can run as a Railway Cron
 service. It incrementally rebuilds the local staging index, publishes the
@@ -15,18 +15,14 @@ from embed_index import run
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Sync Notion and Google Drive into Supabase")
+    parser = argparse.ArgumentParser(description="Sync Notion semantic index into Supabase")
     parser.add_argument("--full", action="store_true", help="re-fetch and re-embed every document")
     parser.add_argument("--upload-only", action="store_true", help="publish the existing gh_bot.db without fetching")
-    parser.add_argument("--notion-only", action="store_true")
-    parser.add_argument("--drive-only", action="store_true")
     args = parser.parse_args()
 
     summary = run(
         full_rebuild=args.full,
         upload_only=args.upload_only,
-        skip_notion=args.drive_only,
-        skip_drive=args.notion_only,
     )
     print(json.dumps(summary, ensure_ascii=False))
 

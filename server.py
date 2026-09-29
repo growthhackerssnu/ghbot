@@ -1195,7 +1195,7 @@ def _load_semantic_index():
 
 @mcp.tool()
 def semantic_search(query: str, top_k: int = 5, source: str = "") -> list[dict]:
-    """Hybrid keyword + semantic search across indexed Notion and Drive content.
+    """Hybrid keyword + semantic search across indexed Notion content.
 
     Use for questions that need synthesis across documents or don't map to a
     clean field/tag. Does NOT yet cover meeting notes. Optional `source` filters
@@ -1211,6 +1211,7 @@ def semantic_search(query: str, top_k: int = 5, source: str = "") -> list[dict]:
         c
         for c in chunks
         if not c["source_label"].startswith("프로젝트_백서(Archive)")
+        and not c["source_label"].startswith("구글드라이브_")
         and (not source or c["source_label"].startswith(source))
     ]
 
