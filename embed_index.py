@@ -192,7 +192,12 @@ class Indexer:
         self.conn = conn
         self.model = model
         self.seen_this_run: dict[str, set[str]] = {}
+        self.successfully_enumerated: set[str] = set()
         self.unchanged = self.updated = self.skipped = 0
+
+    def mark_enumerated(self, label: str) -> None:
+        """Allow stale-row cleanup only after a complete source listing."""
+        self.successfully_enumerated.add(label)
 
     def index_document(self, doc_id: str, url: str, title: str, label: str, edited: str, fetch_body):
         """fetch_body is a zero-arg callable so unchanged documents skip the
@@ -240,7 +245,8 @@ class Indexer:
 
     def sweep_removed(self):
         removed = 0
-        for label, ids in self.seen_this_run.items():
+        for label in self.successfully_enumerated:
+            ids = self.seen_this_run.get(label, set())
             stale = self.conn.execute(
                 "SELECT page_id FROM pages WHERE source_label = ?", (label,)
             ).fetchall()
@@ -267,6 +273,10 @@ def index_notion(indexer: Indexer, notion: NotionClient):
         except NotionAccessError as e:
             print(f"[skip] {label}: not accessible yet - {e}")
             continue
+
+        # A failed listing must not be treated as an empty database: preserve
+        # the last good index until a complete listing succeeds.
+        indexer.mark_enumerated(label)
 
         print(f"[{label}] {len(rows)} pages found")
         for row in rows:
@@ -295,9 +305,16 @@ def index_drive(indexer: Indexer, drive: DriveClient):
     for file_id, team in file_team.items():
         by_team.setdefault(team, []).append(by_id[file_id])
 
-    for team, files in by_team.items():
+    # The bulk Drive listing completed successfully, so an empty team is
+    # meaningful and old rows for it may be swept.  If listing fails above,
+    # this block is never reached and the previous index is preserved.
+    for team in TEAM_FOLDERS:
         label = f"구글드라이브_{team}"
         indexer.seen_this_run.setdefault(label, set())
+        indexer.mark_enumerated(label)
+
+    for team, files in by_team.items():
+        label = f"구글드라이브_{team}"
         print(f"[{label}] {len(files)} files found")
         for f in files:
             indexer.conn.execute(

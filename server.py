@@ -160,6 +160,16 @@ DATABASE_REGISTRY = {
     },
 }
 
+# These databases are the public navigation/search surface of ghbot.  The
+# Notion root contains other databases too, but keeping the scope explicit
+# prevents an unrelated workspace area from silently becoming searchable.
+OFFICIAL_DATABASE_IDS = {entry["database_id"] for entry in DATABASE_REGISTRY.values()}
+
+# A People row is useful for structured routing, but its page body can contain
+# personal information.  Do not place it in the general full-text cache.
+CONTENT_SEARCH_DATABASES = {"projects", "companies", "tasks", "guides"}
+SENSITIVE_PEOPLE_FIELDS = {"전화번호", "이메일", "생일", "LinkedIn", "Profile Image URL", "학번"}
+
 # Compact semantic routing metadata. This is intentionally separate from the
 # raw sitemap: IDs/titles describe structure, while this catalog explains what
 # each area means and which structured filters are authoritative.
@@ -420,6 +430,12 @@ def _get_notion_scope() -> dict[str, dict]:
             if child.get("object") == "database":
                 info = notion.get_database_info(child_id)
                 data_source_id = info.get("data_source_id")
+                if child_id not in OFFICIAL_DATABASE_IDS:
+                    # The root may contain auxiliary databases (for example
+                    # Gallery/Teams/Insights).  They are deliberately outside
+                    # the bot's supported search surface.
+                    scoped.pop(child_id, None)
+                    continue
                 node["title"] = info.get("title") or node["title"]
                 node["data_source_id"] = data_source_id
                 if not data_source_id:
@@ -522,6 +538,13 @@ def _compile_sorts(sorts: list[dict] | None, properties: dict) -> list[dict] | N
     return compiled
 
 
+def _sanitize_database_rows(database: str, rows: list[dict]) -> list[dict]:
+    """Remove private profile fields before returning People DB rows."""
+    if database != "people":
+        return rows
+    return [{key: value for key, value in row.items() if key not in SENSITIVE_PEOPLE_FIELDS} for row in rows]
+
+
 @mcp.tool()
 def describe_database(database: str = "") -> dict:
     """Describe a supported database's fields, types, and select options.
@@ -601,7 +624,7 @@ def query_database(
         max_rows=min(max(max_rows, 1), 5000),
     )
     _known_notion_page_ids.update(row["id"] for row in rows if row.get("id"))
-    return rows
+    return _sanitize_database_rows(key, rows)
 
 
 @mcp.tool()
@@ -610,7 +633,7 @@ def get_sitemap(
     include_schema: bool = False,
     include_files: bool = False,
 ) -> dict:
-    """Return a lightweight inventory scoped to the Growth Hackers root."""
+    """Return a lightweight inventory of the five supported GH databases and Drive."""
     if source not in ("all", "notion", "drive"):
         raise ValueError("source must be all, notion, or drive")
     result: dict = {}
@@ -672,9 +695,33 @@ def list_pages(
     page_size: int = 100,
     cursor: str = "",
 ) -> dict:
-    """List immediate child pages/databases or Drive files/folders."""
+    """List immediate child pages/databases, database rows, or Drive files/folders.
+
+    For a supported Notion database ID, this lists database rows with a
+    cursor; for a normal Notion page, it lists child blocks.
+    """
     if source == "notion":
         _assert_notion_in_scope(parent_id)
+        database = next(
+            ((key, entry) for key, entry in DATABASE_REGISTRY.items() if entry["database_id"] == parent_id),
+            None,
+        )
+        if database:
+            key, entry = database
+            result = notion.query_database_page(
+                entry["data_source_id"],
+                page_size=min(max(page_size, 1), 100),
+                cursor=cursor or None,
+            )
+            rows = _sanitize_database_rows(key, result["results"])
+            _known_notion_page_ids.update(row["id"] for row in rows if row.get("id"))
+            return {
+                "source": "notion",
+                "parent_id": parent_id,
+                "database": key,
+                "results": rows,
+                "next_cursor": result["next_cursor"],
+            }
         return {
             "source": "notion",
             "parent_id": parent_id,
@@ -890,7 +937,7 @@ def search_notion_content(
     scope_database: str = "",
     scope_filters: list[dict] | None = None,
 ) -> dict:
-    """Search keyword occurrences in page titles and bodies under GH root.
+    """Search keyword occurrences in supported non-People page titles and bodies.
 
     Notion's native search is title-only, so this tool maintains an incremental
     body cache in Supabase. The first call can be slow because it fetches all
@@ -914,6 +961,11 @@ def search_notion_content(
 
     if scope_database:
         database_key, database_entry = _resolve_database(scope_database)
+        if database_key not in CONTENT_SEARCH_DATABASES:
+            raise ValueError(
+                f"Body search is not available for {database_key!r}. "
+                "Use query_database for People; People page bodies are excluded for privacy."
+            )
         schema = _get_schema(database_key, database_entry)
         properties = schema.get("properties", {})
         compiled_filter = _compile_filters(scope_filters, properties)
@@ -938,6 +990,8 @@ def search_notion_content(
         all_scope_pages = [
             node for node in _get_notion_scope().values()
             if node.get("object") == "page"
+            and (node.get("parent") or {}).get("database_id")
+            in {DATABASE_REGISTRY[key]["database_id"] for key in CONTENT_SEARCH_DATABASES}
         ]
 
     def matches_scope(node: dict) -> bool:
@@ -1000,16 +1054,17 @@ def search_notion_content(
             on_conflict="page_id",
         )
 
-    stale_ids = set(cached) - set(scope_by_id)
-    for page_id in stale_ids:
-        supabase.delete("ghbot_notion_content", [("page_id", f"eq.{page_id}")])
-
     needle = query.casefold()
     terms = [term.casefold() for term in re.findall(r"[\w가-힣]+", query)]
     matches = []
     current_rows = supabase.select_all("ghbot_notion_content")
     for row in current_rows:
         page_id = row["page_id"]
+        # A scoped interactive search may update only a small slice of the
+        # cache.  Keep other slices for reuse, but never let them leak into
+        # this query's result set.
+        if page_id not in scope_by_id:
+            continue
         title = row.get("title") or ""
         body = row.get("body") or ""
         title_folded = title.casefold()
