@@ -1,6 +1,7 @@
 import http.client
 import json
 import os
+import socket
 import time
 import urllib.request
 import urllib.error
@@ -20,10 +21,13 @@ BASE_URL = "https://api.notion.com/v1"
 # Canonical, actively-maintained project tracker (root "Growth Hackers" hub).
 PROJECTS_DB_ID = "3ae40bd1-0676-8032-8b69-000bdebab973"
 COMPANIES_DB_ID = "3ae40bd1-0676-80fe-bbd3-000bb4c32074"
+PEOPLE_DB_ID = "3ab40bd1-0676-800f-8fd9-000be08aef96"
+TASKS_DB_ID = "3ae40bd1-0676-80ff-8782-000b9897f7ec"
 
 # Historical archive (GH_Project_ARCHIVE Mainpage) and rules/templates (root hub).
 ARCHIVE_DB_ID = "345138fb-f14f-4bd9-8801-bcb2cfd21dad"
 GUIDES_DB_ID = "3b140bd1-0676-80ea-91a0-000b4e171b68"
+INSIGHTS_DB_ID = "3b940bd1-0676-8084-8b67-000b6f1bd4a5"
 
 
 class NotionAccessError(RuntimeError):
@@ -49,7 +53,7 @@ class NotionClient:
                 "Content-Type": "application/json",
             },
         )
-        max_attempts = 3
+        max_attempts = 4
         for attempt in range(1, max_attempts + 1):
             try:
                 with urllib.request.urlopen(req, timeout=30) as resp:
@@ -63,10 +67,24 @@ class NotionClient:
                         f"'...' menu -> Connections -> add the integration)."
                     ) from e
                 if e.code == 429 and attempt < max_attempts:
-                    time.sleep(2 * attempt)
+                    # Notion supplies a retry_after value in the error body
+                    # for burst limits. Respect it so chained DB joins do not
+                    # immediately exhaust the next retry as well.
+                    retry_after = 2 * attempt
+                    try:
+                        detail = json.loads(payload).get("additional_data", {})
+                        retry_after = max(retry_after, float(detail.get("retry_after", 0)))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+                    time.sleep(retry_after)
                     continue
                 raise RuntimeError(f"Notion API error {e.code} on {path}: {payload}") from e
             except (http.client.RemoteDisconnected, ConnectionError, TimeoutError, urllib.error.URLError) as e:
+                if isinstance(e, urllib.error.URLError) and isinstance(e.reason, socket.gaierror):
+                    raise RuntimeError(
+                        "DNS resolution failed for api.notion.com. Check the runtime's network/DNS policy; "
+                        "this is not a Notion filter or authentication error."
+                    ) from e
                 if attempt < max_attempts:
                     time.sleep(1.5 * attempt)
                     continue
@@ -78,16 +96,74 @@ class NotionClient:
         )
         return [self._summarize_search_result(r) for r in result.get("results", [])]
 
+    def search_all(self, max_results: int = 5000, page_size: int = 100) -> list[dict]:
+        """Return all search-visible pages and databases, with parent metadata.
+
+        Notion's search endpoint is the only inexpensive way to enumerate all
+        objects shared with an integration. This is used for sitemap discovery,
+        not for full-text retrieval.
+        """
+        results: list[dict] = []
+        cursor = None
+        while True:
+            body: dict = {"page_size": min(page_size, 100)}
+            if cursor:
+                body["start_cursor"] = cursor
+            result = self._request("POST", "search", body)
+            results.extend(result.get("results", []))
+            if not result.get("has_more") or len(results) >= max_results:
+                break
+            cursor = result.get("next_cursor")
+        return [self._summarize_search_result(r) for r in results[:max_results]]
+
     def _summarize_search_result(self, r: dict) -> dict:
         title = None
-        for prop in r.get("properties", {}).values():
-            if prop.get("type") == "title":
-                title = "".join(t.get("plain_text", "") for t in prop.get("title", []))
+        if r.get("object") == "database":
+            title = "".join(t.get("plain_text", "") for t in r.get("title", []))
+        else:
+            for prop in r.get("properties", {}).values():
+                if prop.get("type") == "title":
+                    title = "".join(t.get("plain_text", "") for t in prop.get("title", []))
+                    break
         return {
             "object": r.get("object"),
             "id": r.get("id"),
             "title": title,
             "url": r.get("url"),
+            "parent": r.get("parent"),
+        }
+
+    def get_database_schema(self, data_source_id: str) -> dict:
+        """Return the live schema for a queryable Notion data source."""
+        raw = self._request(
+            "GET", f"data_sources/{data_source_id}", version=DATA_SOURCE_API_VERSION
+        )
+        properties = {}
+        for name, prop in raw.get("properties", {}).items():
+            ptype = prop.get("type")
+            config = prop.get(ptype) or {}
+            item = {"type": ptype}
+            if ptype in ("select", "status", "multi_select"):
+                item["options"] = [o.get("name") for o in config.get("options", [])]
+            if ptype == "relation":
+                item["database_id"] = config.get("database_id")
+            properties[name] = item
+        return {
+            "id": raw.get("id", data_source_id),
+            "title": "".join(t.get("plain_text", "") for t in raw.get("title", [])),
+            "properties": properties,
+        }
+
+    def get_database_info(self, database_id: str) -> dict:
+        """Return database metadata and its queryable data-source ID."""
+        raw = self._request(
+            "GET", f"databases/{database_id}", version=DATA_SOURCE_API_VERSION
+        )
+        data_sources = raw.get("data_sources", [])
+        return {
+            "id": raw.get("id", database_id),
+            "title": "".join(t.get("plain_text", "") for t in raw.get("title", [])),
+            "data_source_id": data_sources[0].get("id") if data_sources else None,
         }
 
     def query_database(
@@ -106,24 +182,46 @@ class NotionClient:
         all_pages: list[dict] = []
         cursor = None
         while True:
-            body: dict = {"page_size": min(page_size, 100)}
-            if filter_:
-                body["filter"] = filter_
-            if sorts:
-                body["sorts"] = sorts
-            if cursor:
-                body["start_cursor"] = cursor
-            result = self._request(
-                "POST",
-                f"data_sources/{data_source_id}/query",
-                body,
-                version=DATA_SOURCE_API_VERSION,
+            result = self.query_database_page(
+                data_source_id,
+                filter_=filter_,
+                sorts=sorts,
+                page_size=page_size,
+                cursor=cursor,
             )
-            all_pages.extend(result.get("results", []))
-            if not result.get("has_more") or len(all_pages) >= max_rows:
+            all_pages.extend(result["results"])
+            if not result["has_more"] or len(all_pages) >= max_rows:
                 break
-            cursor = result.get("next_cursor")
-        return [self._flatten_page(p) for p in all_pages[:max_rows]]
+            cursor = result["next_cursor"]
+        return all_pages[:max_rows]
+
+    def query_database_page(
+        self,
+        data_source_id: str,
+        filter_: dict | None = None,
+        sorts: list[dict] | None = None,
+        page_size: int = 100,
+        cursor: str | None = None,
+    ) -> dict:
+        """Query one page and preserve the Notion pagination cursor."""
+        body: dict = {"page_size": min(page_size, 100)}
+        if filter_:
+            body["filter"] = filter_
+        if sorts:
+            body["sorts"] = sorts
+        if cursor:
+            body["start_cursor"] = cursor
+        result = self._request(
+            "POST",
+            f"data_sources/{data_source_id}/query",
+            body,
+            version=DATA_SOURCE_API_VERSION,
+        )
+        return {
+            "results": [self._flatten_page(p) for p in result.get("results", [])],
+            "next_cursor": result.get("next_cursor"),
+            "has_more": bool(result.get("has_more")),
+        }
 
     def _flatten_page(self, page: dict) -> dict:
         flat = {
@@ -151,7 +249,11 @@ class NotionClient:
                 return None
             return {"start": value.get("start"), "end": value.get("end")}
         if ptype == "people":
-            return [p.get("name") for p in value or []]
+            # Notion's user object can omit ``name`` (for example when the
+            # integration cannot read a member profile), but its stable ID is
+            # still present. Keep that ID so a People DB's ``Notion ID`` can
+            # be used to filter Tasks' ``관련 인원`` people property.
+            return [p.get("id") for p in value or []]
         if ptype == "relation":
             return [r.get("id") for r in value or []]
         if ptype in ("number", "checkbox", "url", "email", "phone_number"):
@@ -166,7 +268,7 @@ class NotionClient:
         """Given page ids (e.g. from a relation property), fetch their titles.
 
         Cached per-client since the same company/person ids recur across many
-        query_projects/query_archive calls in one server process.
+        relation lookups in one server process.
         """
         titles: dict[str, str] = {}
         for pid in dict.fromkeys(page_ids):  # dedupe, keep order
@@ -188,6 +290,37 @@ class NotionClient:
         lines: list[str] = []
         self._collect_block_text(page_id, lines, max_blocks, depth=0)
         return "\n".join(lines)
+
+    def list_page_children(self, page_id: str, page_size: int = 100, max_results: int = 1000) -> list[dict]:
+        """List child pages/databases directly contained in a Notion page."""
+        children: list[dict] = []
+        cursor = None
+        while True:
+            path = f"blocks/{page_id}/children?page_size={min(page_size, 100)}"
+            if cursor:
+                path += f"&start_cursor={cursor}"
+            result = self._request("GET", path)
+            for block in result.get("results", []):
+                btype = block.get("type")
+                if btype not in ("child_page", "child_database"):
+                    continue
+                content = block.get(btype) or {}
+                children.append(
+                    {
+                        "id": block.get("id"),
+                        "object": "page" if btype == "child_page" else "database",
+                        "title": content.get("title"),
+                        "parent_id": page_id,
+                        "has_children": block.get("has_children", False),
+                        "last_edited_time": block.get("last_edited_time"),
+                    }
+                )
+                if len(children) >= max_results:
+                    return children[:max_results]
+            if not result.get("has_more"):
+                break
+            cursor = result.get("next_cursor")
+        return children
 
     def _collect_block_text(self, block_id: str, lines: list[str], max_blocks: int, depth: int):
         if len(lines) >= max_blocks or depth > 3:

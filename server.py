@@ -1,57 +1,83 @@
 import os
-import sqlite3
+import re
+import time
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
-from dotenv import load_dotenv
 from fastembed import TextEmbedding
 from mcp.server.mcpserver import MCPServer
 
 from notion_client import (
     NotionClient,
+    NotionAccessError,
     PROJECTS_DB_ID,
     COMPANIES_DB_ID,
-    ARCHIVE_DB_ID,
     GUIDES_DB_ID,
+    INSIGHTS_DB_ID,
+    PEOPLE_DB_ID,
+    TASKS_DB_ID,
 )
 from drive_client import DriveClient, TEAM_FOLDERS
+from config import load_env_file
+from supabase_store import SupabaseStore
 
-EMBED_DB_PATH = Path(__file__).parent / "gh_bot.db"
 EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # must match embed_index.py
+NOTION_ROOT_PAGE_ID = "3aa40bd1-0676-80f0-ab3e-e189c7b6380b"
+NOTION_ROOT_TITLE = "Growth Hackers"
 
 # Explicit path so this loads correctly no matter what directory the MCP
 # client launches this process from.
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+load_env_file(Path(__file__).parent / ".env")
+supabase = SupabaseStore()
 
 USAGE_GUIDE = """\
 이 서버는 GH(Growth Hackers) 학회의 Notion과 Google Drive를 조회하는 도구입니다.
 노션은 활동 기록(프로젝트/기업/사람), 드라이브는 공식 문서/사실 조회 용도로
 역할이 나뉘어 있습니다 - 아래 순서로 도구를 고르세요.
 
+0. GH 내부 지식에 관한 질문을 받으면 먼저 get_workspace_catalog을 호출해
+   팀/DB/문서 유형의 의미와 추천 scope를 확인하세요. 카탈로그의 scope_database와
+   scope_filters를 search_notion_content에 그대로 넘길 수 있습니다. 질문에 날짜가
+   명시되지 않았다면 날짜 필터를 임의로 추가하지 마세요.
+
+DB 간 다단계 탐색 원칙:
+- MCP를 시작하면 get_workspace_catalog의 `relationship_graph`를 먼저 확인하세요. 각 edge는
+  어느 DB의 어떤 필드가 어느 DB로 이어지는지, 그리고 조인에 page ID·Notion user ID 중
+  무엇을 써야 하는지를 설명합니다.
+- query_database 결과의 각 `id`는 해당 DB 페이지 ID입니다. target DB의 relation 필드에
+  `contains` 필터로 이 ID를 넣어 역방향 조회할 수 있습니다. 한 DB의 relation 필드를
+  explore_pages로 정방향 탐색할 수도 있습니다.
+- `people` 속성은 relation과 다릅니다. People.Notion ID처럼 Notion 사용자 ID를 담는 필드와
+  Tasks.관련 인원처럼 사용자 ID를 받는 필드는 page ID가 아니라 Notion user ID로 조인하세요.
+- query_database로 반환된 페이지 ID는 같은 MCP 세션에서 fetch_page 또는 explore_pages로
+  바로 읽을 수 있습니다. 관계를 따라갈 때는 목록을 먼저 좁힌 뒤 본문을 읽으세요.
+
 [노션 - 활동 기록]
 
 1. 기업명/기술분류/분기/방법론 태그/규칙 종류처럼 "필드로 정확히 좁혀지는" 질문
-   -> query_projects / query_archive / query_guides 를 먼저 쓰세요.
+   -> query_database를 먼저 쓰세요. describe_database는 필드/옵션을 확인할 때만
+      필요합니다.
    -> 결과가 나오면, 한줄설명만으로 부족하면 fetch_page로 해당 페이지 본문을 읽어서
       구체적 근거(문제 정의, 의사결정 이유, 인원별 역할 등)를 확인한 뒤 답하세요.
 
 2. "OO이 어떤 프로젝트 했어?", "OO 직책이 뭐야?" 같은 사람 중심 질문
-   -> query_person을 쓰세요. 프로젝트 쪽에서 이름으로 역검색하지 마세요 - People DB에
-      참여 프로젝트가 양방향으로 동기화돼 있어서 이름 하나로 바로 팀/직책/기수/참여
-      프로젝트가 다 나옵니다. 전화번호·이메일 등 개인 연락처는 반환하지 않습니다 -
-      필요하다고 요청받아도 다른 방법으로 우회해서 조회하지 마세요.
+   -> query_database(database="people")로 사람 페이지를 찾으세요. 반환된 People 페이지
+      ID로 Projects.참여인원과 Projects.PM을 각각 조회하고, 반환된 Notion ID로
+      Tasks.관련 인원을 조회하세요. 그 뒤 각 프로젝트·회의록의 본문을 읽어 역할의 근거를
+      확인하세요. 전화번호·이메일 등 개인 연락처는 반환하지 않습니다.
 
 3. 여러 프로젝트/문서를 종합해야 하는 질문("보통 어떻게 하는지", "사례들을 종합하면")
    -> 1번으로 후보를 좁힌 뒤, 후보 각각에 fetch_page를 호출해 본문을 교차 확인하세요.
       후보가 1~2개라고 답을 끝내지 말고, 관련 있어 보이는 건 다 열어보세요.
 
 4. 제목/키워드로만 찾아지는 질문(태그가 없는 문서, 팀 소개, 템플릿 등)
-   -> search_pages로 찾고, 마찬가지로 fetch_page로 본문을 확인하세요.
+   -> search_pages 또는 get_sitemap/list_pages로 위치를 확인하고, fetch_page로 본문을 읽으세요.
 
-5. 방법론/의사결정 맥락을 종합해야 하는 서술형 질문, 회의록 관련
-   -> semantic_search를 쓰세요 (노션 프로젝트 백서/진행중 프로젝트 대상 - 회의록은
-      아직 이 인덱스에 없습니다. 회의록은 search_pages로 후보를 찾은 뒤 fetch_page로
-      본문 전체를 읽고 직접 인용을 포함해 답하세요).
+5. 회의록/본문에서 특정 키워드를 찾는 질문
+   -> search_notion_content를 쓰세요. 회의록은 Tasks DB에서 종류=회의와
+      담당부서(운영진/회장단 등)를 먼저 필터링한 뒤, 그 결과 페이지만 본문 검색하세요.
+   -> 여러 문서의 방법론/의사결정 맥락을 종합하는 질문은 semantic_search를 쓰세요.
 
 [구글 드라이브 - 공식 문서·사실 조회]
 
@@ -103,114 +129,1047 @@ mcp = MCPServer(
 notion = NotionClient()
 drive = DriveClient()
 
+# These are stable aliases over Notion data-source IDs. The public API accepts
+# the aliases so clients do not need to know Notion's internal identifiers.
+# database_id is retained for sitemap/schema correlation; data_source_id is
+# what the Notion query endpoint actually accepts.
+DATABASE_REGISTRY = {
+    "tasks": {
+        "data_source_id": TASKS_DB_ID,
+        "database_id": "3ae40bd1-0676-8076-8b51-cccd75bfe12d",
+        "aliases": {"task", "tasks", "업무", "태스크"},
+    },
+    "companies": {
+        "data_source_id": COMPANIES_DB_ID,
+        "database_id": "3ae40bd1-0676-8088-9fe0-f7ce3f4b54d5",
+        "aliases": {"company", "companies", "기업"},
+    },
+    "people": {
+        "data_source_id": PEOPLE_DB_ID,
+        "database_id": "3ab40bd1-0676-8018-921c-feb99ec75fe3",
+        "aliases": {"person", "people", "member", "members", "사람", "멤버"},
+    },
+    "projects": {
+        "data_source_id": PROJECTS_DB_ID,
+        "database_id": "3ae40bd1-0676-8047-9aa2-d62acf91b87e",
+        "aliases": {"project", "projects", "프로젝트"},
+    },
+    "guides": {
+        "data_source_id": GUIDES_DB_ID,
+        "database_id": "3b140bd1-0676-8045-9c2b-e634060ae251",
+        "aliases": {"guide", "guides", "안내서", "가이드"},
+    },
+}
 
-def _and(*filters):
-    filters = [f for f in filters if f]
+# These are the top-level navigation/search surface of ghbot. Insights is
+# project-scoped: users reach it through a specific project rather than an
+# unrelated top-level knowledge area.
+CORE_SITEMAP_DATABASES = {"people", "projects", "companies", "tasks", "guides"}
+OFFICIAL_DATABASE_IDS = {
+    DATABASE_REGISTRY[key]["database_id"] for key in CORE_SITEMAP_DATABASES
+}
+
+# A People row is useful for structured routing, but its page body can contain
+# personal information.  Do not place it in the general full-text cache.
+CONTENT_SEARCH_DATABASES = {"projects", "companies", "tasks", "guides"}
+SENSITIVE_PEOPLE_FIELDS = {"전화번호", "이메일", "생일", "LinkedIn", "Profile Image URL", "학번"}
+
+# Compact semantic routing metadata. This is intentionally separate from the
+# raw sitemap: IDs/titles describe structure, while this catalog explains what
+# each area means and which structured filters are authoritative.
+WORKSPACE_CATALOG = {
+    "version": 2,
+    "overview": "Growth Hackers의 활동 기록은 Notion, 공식 사실/문서는 Google Drive에 있습니다.",
+    "notion_databases": [
+        {
+            "name": "projects",
+            "meaning": "기업과 함께 수행한 프로젝트의 분기, 기술, PM, 참여인원, 한줄설명과 본문",
+            "use_for": ["어떤 프로젝트를 했는지", "기술 분류", "분기별 사례", "프로젝트 본문"],
+            "key_fields": ["분기", "기술분류", "기업", "PM", "참여인원", "Name"],
+        },
+        {
+            "name": "companies",
+            "meaning": "협업 기업과 산업 분류, 홈페이지, 연결된 프로젝트",
+            "use_for": ["기업 정보", "기업별 프로젝트"],
+            "key_fields": ["산업 분류", "프로젝트", "홈페이지", "Name"],
+        },
+        {
+            "name": "people",
+            "meaning": "회원의 소속팀, 직책, 기수, 프로젝트 관계와 Notion 사용자 ID",
+            "use_for": ["사람의 조직 정보", "사람에서 프로젝트·회의록으로 점프"],
+            "key_fields": ["소속팀", "직책", "기수", "참여 프로젝트", "Notion ID", "Name"],
+        },
+        {
+            "name": "tasks",
+            "meaning": "운영 업무와 회의록 인덱스. 회의/부서/날짜 필터가 가장 중요함",
+            "use_for": ["운영진·회장단·팀별 회의록", "업무 일정", "리크루팅·수주·예산 업무"],
+            "key_fields": ["종류", "담당부서", "날짜", "운영 기수", "진행상태", "Name"],
+        },
+        {
+            "name": "guides",
+            "meaning": "안내서, 규칙, 인수인계, 계획서, 템플릿과 아카이빙 문서",
+            "use_for": ["운영 방법", "규칙·내규", "팀 인수인계", "템플릿"],
+            "key_fields": ["종류", "태그", "상태", "운영 기수", "Name"],
+        },
+    ],
+    "project_scoped_databases": [
+        {
+            "name": "insights",
+            "meaning": "각 프로젝트에 연결된 성공·실패 인사이트와 한줄 요약",
+            "access": "get_project_insights(project_id) 또는 Insights.연관 프로젝트 relation 역조회",
+            "key_fields": ["인사이트 타입", "인사이트 분야", "연관 프로젝트", "인사이트 한줄요약", "Name"],
+        },
+    ],
+    "domains": [
+        {
+            "name": "운영진/회장단",
+            "meaning": "학회 전체 운영과 주요 의사결정",
+            "scope_database": "tasks",
+            "scope_filters": [
+                {"and": [
+                    {"field": "종류", "op": "equals", "value": "회의"},
+                    {"or": [
+                        {"field": "담당부서", "op": "contains", "value": "운영진"},
+                        {"field": "담당부서", "op": "contains", "value": "회장단"},
+                    ]},
+                ]},
+            ],
+            "hints": ["법인", "정관", "조직", "의사결정", "전체 운영", "출석", "벌점"],
+        },
+        {
+            "name": "DH",
+            "meaning": "대외협력, 기업 발굴, 수주, 계약, 프로젝트 커뮤니케이션",
+            "scope_database": "tasks",
+            "scope_filters": [{"field": "담당부서", "op": "contains", "value": "DH"}],
+            "drive_team": "DH",
+            "hints": ["수주", "계약", "기업", "파트너십", "대외협력"],
+        },
+        {
+            "name": "NUT",
+            "meaning": "내부 운영, 총무, 예산, 법인화와 정관 관련 공식 운영 자료",
+            "drive_team": "NUT",
+            "hints": ["예산", "정관", "법인", "총무", "내부 운영", "멘멘", "MT"],
+        },
+        {
+            "name": "HR",
+            "meaning": "리크루팅, 인사, 알럼나이",
+            "scope_database": "tasks",
+            "scope_filters": [{"field": "담당부서", "op": "contains", "value": "HR"}],
+            "drive_team": "HR",
+            "hints": ["리크루팅", "면접", "알럼나이", "퀘스트"],
+        },
+        {
+            "name": "PR",
+            "meaning": "홈페이지, 인스타그램, 콘텐츠와 외부 홍보",
+            "scope_database": "tasks",
+            "scope_filters": [{"field": "담당부서", "op": "contains", "value": "PR"}],
+            "drive_team": "PR",
+            "hints": ["홈페이지", "인스타", "카드뉴스", "홍보"],
+        },
+        {
+            "name": "EDU",
+            "meaning": "교육 세션, 과제, 커리큘럼과 교육 자료",
+            "drive_team": "EDU",
+            "hints": ["교육", "세션", "과제", "커리큘럼"],
+        },
+    ],
+    "routes": [
+        {
+            "intent": ["법인", "정관", "조직 구조", "전체 운영"],
+            "scopes": ["운영진/회장단", "NUT"],
+            "next": "search_notion_content 또는 search_drive",
+        },
+        {
+            "intent": ["수주", "계약", "기업 협업", "파트너십"],
+            "scopes": ["DH", "운영진/회장단"],
+            "next": "search_notion_content와 search_drive를 둘 다 고려",
+        },
+        {
+            "intent": ["리크루팅", "면접", "알럼나이"],
+            "scopes": ["HR", "PR"],
+            "next": "query_database 또는 read_spreadsheet",
+        },
+    ],
+    "relationship_graph": [
+        {
+            "from": "people",
+            "from_field": "참여 프로젝트",
+            "to": "projects",
+            "to_field": "참여인원",
+            "join_key": "People page ID",
+            "direction": "people -> projects (direct relation); projects -> people (reverse filter)",
+            "purpose": "구성원과 프로젝트 참여 이력을 연결함",
+        },
+        {
+            "from": "people",
+            "from_field": "People page ID",
+            "to": "projects",
+            "to_field": "PM",
+            "join_key": "People page ID",
+            "direction": "projects -> people relation; filter Projects.PM by People page ID",
+            "purpose": "프로젝트의 PM·책임자 이력을 연결함",
+        },
+        {
+            "from": "people",
+            "from_field": "Notion ID",
+            "to": "tasks",
+            "to_field": "관련 인원",
+            "join_key": "Notion user ID",
+            "direction": "cross-type user identity join",
+            "purpose": "구성원과 참석·관련 회의록 및 업무를 연결함",
+            "filter_example": {"field": "관련 인원", "op": "contains", "value": "<People.Notion ID의 첫 값>"},
+        },
+        {
+            "from": "projects",
+            "from_field": "기업",
+            "to": "companies",
+            "to_field": "프로젝트",
+            "join_key": "Project page ID",
+            "direction": "bidirectional relation",
+            "purpose": "프로젝트와 협업 기업을 연결함",
+        },
+        {
+            "from": "projects",
+            "from_field": "id",
+            "to": "insights",
+            "to_field": "연관 프로젝트",
+            "join_key": "Project page ID",
+            "direction": "projects -> insights reverse relation filter",
+            "purpose": "프로젝트의 성공·실패 인사이트와 재사용 가능한 교훈을 연결함",
+        },
+        {
+            "from": "tasks",
+            "from_field": "(DH) 기업",
+            "to": "companies",
+            "to_field": "프로젝트",
+            "join_key": "Company page ID",
+            "direction": "tasks -> companies relation",
+            "purpose": "대외협력 업무·계약 기록과 협업 기업을 연결함",
+        },
+        {
+            "from": "tasks",
+            "from_field": "선행 작업 / 후행 작업",
+            "to": "tasks",
+            "to_field": "id",
+            "join_key": "Task page ID",
+            "direction": "self relation",
+            "purpose": "업무·회의·일정의 의존 관계를 추적함",
+        },
+    ],
+    "multi_hop_query_pattern": [
+        "시작 DB에서 엔터티를 query_database로 찾고 결과 page ID와 사용자 ID 계열 필드를 보관한다.",
+        "relationship_graph에서 다음 edge의 join_key를 확인한다.",
+        "관계 필드면 explore_pages로 정방향 탐색하거나, 대상 DB에서 해당 relation field contains <page ID>로 역방향 조회한다.",
+        "people field면 대응되는 Notion user ID를 사용해 대상 DB에서 contains 필터로 조회한다.",
+        "각 단계에서 반환된 page ID를 fetch_page로 읽어, 속성만으로 확인되지 않는 역할·결정·근거를 검증한다.",
+    ],
+    "tool_guidance": {
+        "get_sitemap": "원시 구조·ID·부모 관계를 확인할 때만 사용",
+        "describe_database": "카탈로그에 없는 최신 필드·옵션이 필요할 때 사용",
+        "search_notion_content": "DB 필터로 후보를 줄인 뒤 본문 키워드를 찾을 때 사용",
+        "semantic_search": "여러 문서의 의미·방법론·의사결정을 종합할 때 사용",
+    },
+}
+_schema_cache: dict[str, dict] = {}
+_notion_scope_cache: dict[str, dict] | None = None
+_known_notion_page_ids: set[str] = set()
+
+
+def _resolve_database(name: str) -> tuple[str, dict]:
+    value = (name or "").strip().lower()
+    for key, entry in DATABASE_REGISTRY.items():
+        if value == key or value in {a.lower() for a in entry["aliases"]}:
+            return key, entry
+    valid = ", ".join(DATABASE_REGISTRY)
+    raise ValueError(f"Unknown database {name!r}. Use one of: {valid}")
+
+
+def _get_schema(key: str, entry: dict) -> dict:
+    if key not in _schema_cache:
+        _schema_cache[key] = notion.get_database_schema(entry["data_source_id"])
+    return _schema_cache[key]
+
+
+def _parent_id(node: dict) -> str | None:
+    parent = node.get("parent") or {}
+    return next((value for key, value in parent.items() if key.endswith("_id")), None)
+
+
+def _get_notion_scope() -> dict[str, dict]:
+    """Enumerate only objects descended from the Growth Hackers root.
+
+    This deliberately walks the root's children instead of using Notion's
+    workspace-wide search endpoint. Database rows are included as children of
+    their database; nested page contents are discovered later through
+    list_pages/fetch_page when the client asks for them.
+    """
+    global _notion_scope_cache
+    if _notion_scope_cache is not None:
+        return _notion_scope_cache
+
+    scoped = {
+        NOTION_ROOT_PAGE_ID: {
+            "object": "page",
+            "id": NOTION_ROOT_PAGE_ID,
+            "title": NOTION_ROOT_TITLE,
+            "url": f"https://www.notion.so/{NOTION_ROOT_PAGE_ID.replace('-', '')}",
+            "parent": None,
+        }
+    }
+
+    visited_pages: set[str] = set()
+
+    def row_title(row: dict) -> str | None:
+        for key in ("Name", "Task name", "Title"):
+            if isinstance(row.get(key), str) and row[key]:
+                return row[key]
+        for key, value in row.items():
+            if key in ("id", "url", "last_edited_time"):
+                continue
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def walk_page(page_id: str) -> None:
+        if page_id in visited_pages:
+            return
+        visited_pages.add(page_id)
+        for child in notion.list_page_children(page_id, page_size=100):
+            child_id = child.get("id")
+            if not child_id:
+                continue
+            parent = {"type": "page_id", "page_id": page_id}
+            node = {
+                "object": child.get("object"),
+                "id": child_id,
+                "title": child.get("title"),
+                "url": child.get("url"),
+                "parent": parent,
+                "last_edited_time": child.get("last_edited_time"),
+            }
+            scoped[child_id] = node
+            if child.get("object") == "database":
+                info = notion.get_database_info(child_id)
+                data_source_id = info.get("data_source_id")
+                if child_id not in OFFICIAL_DATABASE_IDS:
+                    # The root may contain auxiliary databases (for example
+                    # Gallery/Teams/Insights).  They are deliberately outside
+                    # the bot's supported search surface.
+                    scoped.pop(child_id, None)
+                    continue
+                node["title"] = info.get("title") or node["title"]
+                node["data_source_id"] = data_source_id
+                if not data_source_id:
+                    continue
+                for row in notion.query_database(data_source_id, max_rows=5000):
+                    scoped[row["id"]] = {
+                        "object": "page",
+                        "id": row["id"],
+                        "title": row_title(row),
+                        "url": row.get("url"),
+                        "parent": {"type": "database_id", "database_id": child_id},
+                        "last_edited_time": row.get("last_edited_time"),
+                    }
+            else:
+                walk_page(child_id)
+
+    walk_page(NOTION_ROOT_PAGE_ID)
+    _notion_scope_cache = scoped
+    return scoped
+
+
+def _assert_notion_in_scope(page_id: str) -> None:
+    # A database query has already established that these pages belong to a
+    # registered GH database. Avoid rebuilding the entire Notion sitemap just
+    # to read a result returned in the same MCP session.
+    if page_id in _known_notion_page_ids:
+        return
+    if page_id not in _get_notion_scope():
+        raise ValueError("The requested Notion page is outside the Growth Hackers root")
+
+
+def _compile_filter(node: dict, properties: dict) -> dict:
+    """Compile the small public filter DSL into Notion's filter format."""
+    if "and" in node or "or" in node:
+        logic = "and" if "and" in node else "or"
+        children = node[logic]
+        if not isinstance(children, list) or not children:
+            raise ValueError(f"{logic} must contain a non-empty list")
+        return {logic: [_compile_filter(child, properties) for child in children]}
+
+    field = node.get("field")
+    operator = node.get("op", node.get("operator"))
+    if field not in properties:
+        raise ValueError(f"Unknown property {field!r}. Available properties: {', '.join(properties)}")
+    if not operator:
+        raise ValueError(f"Filter for {field!r} is missing op")
+
+    ptype = properties[field]["type"]
+    operators = {
+        "title": {"equals", "not_equals", "contains", "does_not_contain", "is_empty", "is_not_empty"},
+        "rich_text": {"equals", "not_equals", "contains", "does_not_contain", "is_empty", "is_not_empty"},
+        "select": {"equals", "not_equals", "is_empty", "is_not_empty"},
+        "status": {"equals", "not_equals", "is_empty", "is_not_empty"},
+        "multi_select": {"contains", "does_not_contain", "is_empty", "is_not_empty"},
+        "relation": {"contains", "does_not_contain", "is_empty", "is_not_empty"},
+        "people": {"contains", "does_not_contain", "is_empty", "is_not_empty"},
+        "date": {"equals", "before", "after", "on_or_before", "on_or_after", "is_empty", "is_not_empty"},
+        "number": {"equals", "not_equals", "greater_than", "greater_than_or_equal_to", "less_than", "less_than_or_equal_to", "is_empty", "is_not_empty"},
+        "checkbox": {"equals", "not_equals"},
+        "url": {"equals", "contains", "does_not_contain", "is_empty", "is_not_empty"},
+        "email": {"equals", "contains", "does_not_contain", "is_empty", "is_not_empty"},
+        "phone_number": {"equals", "contains", "does_not_contain", "is_empty", "is_not_empty"},
+    }
+    if ptype not in operators or operator not in operators[ptype]:
+        raise ValueError(f"Operator {operator!r} is not supported for {field!r} ({ptype})")
+
+    notion_operator = {
+        "not_equals": "does_not_equal",
+        "does_not_contain": "does_not_contain",
+    }.get(operator, operator)
+    value = node.get("value")
+    if operator not in ("is_empty", "is_not_empty") and value is None:
+        raise ValueError(f"Filter {field!r}/{operator!r} requires value")
+    if ptype == "checkbox":
+        value = bool(value)
+    elif ptype == "relation" and isinstance(value, dict):
+        value = value.get("id")
+    return {"property": field, ptype: {notion_operator: value} if operator not in ("is_empty", "is_not_empty") else {notion_operator: True}}
+
+
+def _compile_filters(filters: list[dict] | None, properties: dict) -> dict | None:
     if not filters:
         return None
-    if len(filters) == 1:
-        return filters[0]
-    return {"and": filters}
+    compiled = [_compile_filter(item, properties) for item in filters]
+    return compiled[0] if len(compiled) == 1 else {"and": compiled}
+
+
+def _compile_sorts(sorts: list[dict] | None, properties: dict) -> list[dict] | None:
+    if not sorts:
+        return None
+    compiled = []
+    for item in sorts:
+        field = item.get("field")
+        if field not in properties:
+            raise ValueError(f"Unknown sort property {field!r}")
+        direction = item.get("direction", "descending")
+        if direction not in ("ascending", "descending"):
+            raise ValueError("sort direction must be ascending or descending")
+        compiled.append({"property": field, "direction": direction})
+    return compiled
+
+
+def _sanitize_database_rows(database: str, rows: list[dict]) -> list[dict]:
+    """Remove private profile fields before returning People DB rows."""
+    if database != "people":
+        return rows
+    return [{key: value for key, value in row.items() if key not in SENSITIVE_PEOPLE_FIELDS} for row in rows]
+
+
+@mcp.tool()
+def describe_database(database: str = "") -> dict:
+    """Describe a supported database's fields, types, and select options.
+
+    The schema is cached for the lifetime of the server. Call without a name
+    to discover the stable aliases accepted by query_database.
+    """
+    if not database:
+        return {
+            "databases": [
+                {"name": key, "aliases": sorted(entry["aliases"])}
+                for key, entry in DATABASE_REGISTRY.items()
+            ]
+        }
+    key, entry = _resolve_database(database)
+    schema = _get_schema(key, entry)
+    return {
+        "database": key,
+        "data_source_id": entry["data_source_id"],
+        "database_id": entry["database_id"],
+        "title": schema.get("title") or key,
+        "properties": schema.get("properties", {}),
+    }
+
+
+@mcp.tool()
+def get_workspace_catalog(include_live_schemas: bool = False) -> dict:
+    """Return the compact semantic map for routing GH questions.
+
+    This explains what each Notion database, team area, and document family
+    means. It is intentionally smaller than get_sitemap, which is a raw
+    structural inventory. Set include_live_schemas when current field options
+    are needed in addition to the curated routing metadata.
+    """
+    catalog = deepcopy(WORKSPACE_CATALOG)
+    catalog["database_aliases"] = {
+        key: sorted(entry["aliases"])
+        for key, entry in DATABASE_REGISTRY.items()
+    }
+    catalog["drive_teams"] = [
+        {"name": name, "meaning": next(
+            (domain["meaning"] for domain in catalog["domains"] if domain.get("drive_team") == name),
+            "공식 문서·운영 자료",
+        )}
+        for name in TEAM_FOLDERS
+    ]
+    if include_live_schemas:
+        catalog["live_schemas"] = {
+            key: _get_schema(key, entry)
+            for key, entry in DATABASE_REGISTRY.items()
+        }
+    return catalog
+
+
+@mcp.tool()
+def query_database(
+    database: str,
+    filters: list[dict] | None = None,
+    sorts: list[dict] | None = None,
+    page_size: int = 100,
+    max_rows: int = 1000,
+) -> list[dict]:
+    """Query a supported Notion database with typed, database-aware filters.
+
+    Each filter is {field, op, value}; multiple filters are ANDed. Use an
+    {"or": [...]} or {"and": [...]} group for nested logic. Relation values
+    must be Notion page IDs (or {"id": "..."}).
+    """
+    key, entry = _resolve_database(database)
+    schema = _get_schema(key, entry)
+    properties = schema.get("properties", {})
+    rows = notion.query_database(
+        entry["data_source_id"],
+        filter_=_compile_filters(filters, properties),
+        sorts=_compile_sorts(sorts, properties),
+        page_size=min(max(page_size, 1), 100),
+        max_rows=min(max(max_rows, 1), 5000),
+    )
+    _known_notion_page_ids.update(row["id"] for row in rows if row.get("id"))
+    return _sanitize_database_rows(key, rows)
+
+
+@mcp.tool()
+def get_sitemap(
+    source: str = "all",
+    include_schema: bool = False,
+    include_files: bool = False,
+) -> dict:
+    """Return a lightweight inventory of the supported GH databases and Drive."""
+    if source not in ("all", "notion", "drive"):
+        raise ValueError("source must be all, notion, or drive")
+    result: dict = {}
+    if source in ("all", "notion"):
+        nodes = [node for node in _get_notion_scope().values()]
+        normalized = []
+        known_by_db_id = {e["database_id"]: (k, e) for k, e in DATABASE_REGISTRY.items()}
+        for node in nodes:
+            parent = node.get("parent") or {}
+            parent_id = _parent_id(node)
+            item = {
+                "id": node.get("id"),
+                "type": node.get("object"),
+                "title": node.get("title"),
+                "url": node.get("url"),
+                "parent_id": parent_id,
+                "parent_type": parent.get("type"),
+            }
+            if node.get("object") == "database" and node.get("id") in known_by_db_id:
+                key, entry = known_by_db_id[node["id"]]
+                item["database"] = key
+                if include_schema:
+                    item["schema"] = _get_schema(key, entry)
+            normalized.append(item)
+        result["notion"] = normalized
+    if source in ("all", "drive"):
+        folders = drive.list_all_folders()
+        normalized = [
+            {
+                "id": folder["id"],
+                "type": "folder",
+                "title": folder["name"],
+                "parent_id": (folder.get("parents") or [None])[0],
+                "modifiedTime": folder.get("modifiedTime"),
+            }
+            for folder in folders
+        ]
+        if include_files:
+            for file in drive.list_all_files():
+                normalized.append(
+                    {
+                        "id": file["id"],
+                        "type": "file",
+                        "title": file["name"],
+                        "mimeType": file.get("mimeType"),
+                        "parent_id": (file.get("parents") or [None])[0],
+                        "modifiedTime": file.get("modifiedTime"),
+                        "url": file.get("webViewLink"),
+                    }
+                )
+        result["drive"] = normalized
+    return result
+
+
+@mcp.tool()
+def list_pages(
+    source: str,
+    parent_id: str,
+    page_size: int = 100,
+    cursor: str = "",
+) -> dict:
+    """List immediate child pages/databases, database rows, or Drive files/folders.
+
+    For a supported Notion database ID, this lists database rows with a
+    cursor; for a normal Notion page, it lists child blocks.
+    """
+    if source == "notion":
+        database = next(
+            ((key, entry) for key, entry in DATABASE_REGISTRY.items() if entry["database_id"] == parent_id),
+            None,
+        )
+        if database:
+            key, entry = database
+            result = notion.query_database_page(
+                entry["data_source_id"],
+                page_size=min(max(page_size, 1), 100),
+                cursor=cursor or None,
+            )
+            rows = _sanitize_database_rows(key, result["results"])
+            _known_notion_page_ids.update(row["id"] for row in rows if row.get("id"))
+            return {
+                "source": "notion",
+                "parent_id": parent_id,
+                "database": key,
+                "results": rows,
+                "next_cursor": result["next_cursor"],
+            }
+        _assert_notion_in_scope(parent_id)
+        return {
+            "source": "notion",
+            "parent_id": parent_id,
+            "results": notion.list_page_children(parent_id, page_size=min(page_size, 100)),
+            "next_cursor": None,
+        }
+    if source == "drive":
+        result = drive.list_children(parent_id, page_size=page_size, page_token=cursor or None)
+        return {
+            "source": "drive",
+            "parent_id": parent_id,
+            "results": result["results"],
+            "next_cursor": result["next_page_token"],
+        }
+    raise ValueError("source must be notion or drive")
 
 
 @mcp.tool()
 def search_pages(query: str) -> list[dict]:
-    """Keyword/title search across Notion pages shared with this integration."""
-    return notion.search(query)
-
-
-@mcp.tool()
-def query_projects(company: str = "", tech: str = "", quarter: str = "") -> list[dict]:
-    """Look up GH project records by client/company name, 기술분류 (e.g. '추천시스템'), or 분기 (e.g. '26.3Q').
-
-    Company names live in a separate Companies database and are linked via a
-    relation, so a company name is resolved to its page id first. The response
-    also includes 기업명/PM명/참여인원명 - resolved human names for the raw
-    relation ids in 기업/PM/참여인원.
-    """
-    company_filter = None
-    if company:
-        matches = notion.query_database(
-            COMPANIES_DB_ID,
-            filter_={"property": "Name", "title": {"contains": company}},
-        )
-        if not matches:
-            return []
-        company_filter = {
-            "or": [{"property": "기업", "relation": {"contains": m["id"]}} for m in matches]
+    """Title search limited to pages/databases under the Growth Hackers root."""
+    needle = query.strip().lower()
+    return [
+        {
+            "object": node.get("object"),
+            "id": node.get("id"),
+            "title": node.get("title"),
+            "url": node.get("url"),
+            "parent": node.get("parent"),
         }
-
-    filter_ = _and(
-        company_filter,
-        {"property": "기술분류", "multi_select": {"contains": tech}} if tech else None,
-        {"property": "분기", "select": {"equals": quarter}} if quarter else None,
-    )
-    rows = notion.query_database(PROJECTS_DB_ID, filter_=filter_)
-
-    # 기업/PM/참여인원 are relations - resolve ids to human-readable names in one batch.
-    relation_fields = ["기업", "PM", "참여인원"]
-    all_ids = [cid for r in rows for field in relation_fields for cid in r.get(field, [])]
-    names = notion.resolve_titles(all_ids) if all_ids else {}
-    for r in rows:
-        for field in relation_fields:
-            r[f"{field}명"] = [names.get(cid, cid) for cid in r.get(field, [])]
-    return rows
-
-
-@mcp.tool()
-def query_archive(topic_tag: str = "", project_page_id: str = "") -> list[dict]:
-    """Look up project archive/whitepaper entries by methodology tag (e.g. 'Sequential', 'RecSys') or linked project page id."""
-    filter_ = _and(
-        {"property": "Topic", "multi_select": {"contains": topic_tag}} if topic_tag else None,
-        {"property": "Project", "relation": {"contains": project_page_id}} if project_page_id else None,
-    )
-    return notion.query_database(ARCHIVE_DB_ID, filter_=filter_)
-
-
-@mcp.tool()
-def query_guides(kind: str = "", owner: str = "", tag: str = "") -> list[dict]:
-    """Look up rules/templates/handover docs by 종류 (규칙/템플릿/인수인계/...), 책임자, or 태그."""
-    filter_ = _and(
-        {"property": "종류", "select": {"equals": kind}} if kind else None,
-        {"property": "책임자", "select": {"equals": owner}} if owner else None,
-        {"property": "태그", "multi_select": {"contains": tag}} if tag else None,
-    )
-    return notion.query_database(GUIDES_DB_ID, filter_=filter_)
+        for node in _get_notion_scope().values()
+        if not needle or needle in (node.get("title") or "").lower()
+    ]
 
 
 @mcp.tool()
 def fetch_page(page_id: str) -> str:
     """Fetch a Notion page's body as plain text, for reading a specific whitepaper/meeting note in full."""
+    _assert_notion_in_scope(page_id)
     return notion.fetch_page_text(page_id)
 
 
 @mcp.tool()
-def query_person(name: str) -> dict:
-    """Look up a GH member by name: their 소속팀(team)/직책(role)/기수(generation)
-    and which projects they've participated in as PM or 참여인원 (People DB's
-    참여 프로젝트 relation is pre-synced both ways, so this is a single fetch,
-    not a reverse search across every project).
+def get_project_insights(project_id: str) -> list[dict]:
+    """Return the success/failure insights linked to one Projects page.
 
-    Returns organizational info only - phone/email/생일/LinkedIn are
-    deliberately excluded even though they exist on the page, since this
-    lookup may be used by other members and personal contact info isn't
-    something the bot should hand out.
+    Insights is project-scoped rather than a top-level sitemap area.  Start by
+    finding a project with query_database or list_pages, then pass its page ID.
     """
-    matches = [m for m in notion.search(name) if m.get("object") == "page" and name in (m.get("title") or "")]
-    if not matches:
+    # This is intentionally a project-only route: Insights is a root-level
+    # Notion database operationally, but its rows are meaningful only via the
+    # `연관 프로젝트` relation. Do not expose it as a global browse/search DB.
+    project = _get_notion_scope().get(project_id)
+    if not project or (project.get("parent") or {}).get("database_id") != DATABASE_REGISTRY["projects"]["database_id"]:
+        raise ValueError("project_id must be a page in the Projects database")
+    rows = notion.query_database(
+        INSIGHTS_DB_ID,
+        filter_={"property": "연관 프로젝트", "relation": {"contains": project_id}},
+        max_rows=100,
+    )
+    _known_notion_page_ids.update(row["id"] for row in rows if row.get("id"))
+    return rows
+
+
+def _page_title(page: dict, scoped: dict | None = None) -> str:
+    for key in ("Name", "Task name", "Title"):
+        value = page.get(key)
+        if isinstance(value, str) and value:
+            return value
+    if scoped and scoped.get("title"):
+        return scoped["title"]
+    return "(untitled)"
+
+
+def _relation_ids(value) -> list[str]:
+    """Normalize a flattened Notion relation property to page IDs."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item]
+
+
+def _extract_sections(text: str, requested: list[str]) -> dict[str, str]:
+    """Extract markdown heading sections whose heading contains a request."""
+    if not requested:
         return {}
-    person = notion.get_page(matches[0]["id"])
+    wanted = [(item, item.casefold()) for item in requested if item.strip()]
+    lines = text.splitlines()
+    headings = []
+    for index, line in enumerate(lines):
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            headings.append((index, len(match.group(1)), match.group(2).strip()))
 
-    project_ids = person.get("참여 프로젝트", [])
-    project_names = notion.resolve_titles(project_ids) if project_ids else {}
+    found: dict[str, str] = {}
+    for index, level, heading in headings:
+        heading_folded = heading.casefold()
+        matches = [name for name, folded in wanted if folded in heading_folded]
+        if not matches:
+            continue
+        end = len(lines)
+        for next_index, next_level, _ in headings:
+            if next_index > index and next_level <= level:
+                end = next_index
+                break
+        section = "\n".join(lines[index:end]).strip()
+        for name in matches:
+            found[name] = section
+    return found
 
+
+def _strip_named_sections(text: str, section_names: list[str]) -> str:
+    """Remove complete Markdown sections before a broad body-cache search."""
+    if not section_names:
+        return text
+    blocked = {name.casefold() for name in section_names}
+    kept: list[str] = []
+    skip_level: int | None = None
+    for line in text.splitlines():
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            level = len(match.group(1))
+            title = match.group(2).strip().casefold()
+            if title in blocked:
+                skip_level = level
+                continue
+            if skip_level is not None and level <= skip_level:
+                skip_level = None
+        if skip_level is None:
+            kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def _page_snapshot(
+    page_id: str,
+    depth: int,
+    include_properties: bool,
+    include_body: bool,
+    sections: list[str],
+) -> tuple[dict, dict]:
+    _assert_notion_in_scope(page_id)
+    page = notion.get_page(page_id)
+    # `page_id` may be a result from query_database and is therefore already
+    # trusted. Do not trigger an expensive full sitemap walk merely to obtain
+    # optional title metadata.
+    scoped = (_notion_scope_cache or {}).get(page_id, {})
+    body = ""
+    if include_body or sections:
+        body = notion.fetch_page_text(page_id, max_blocks=1000)
+    result = {
+        "id": page_id,
+        "title": _page_title(page, scoped),
+        "url": page.get("url") or scoped.get("url"),
+        "depth": depth,
+        "last_edited_time": page.get("last_edited_time") or scoped.get("last_edited_time"),
+    }
+    if include_properties:
+        result["properties"] = page
+    if include_body:
+        result["body"] = body
+    if sections:
+        result["sections"] = _extract_sections(body, sections)
+    return result, page
+
+
+@mcp.tool()
+def explore_pages(
+    page_ids: list[str],
+    relation_properties: list[str] | None = None,
+    depth: int = 1,
+    include_properties: bool = True,
+    include_body: bool = False,
+    sections: list[str] | None = None,
+    max_pages: int = 50,
+) -> dict:
+    """Traverse Notion pages through relation properties.
+
+    This is a generic graph/join-like operation. For example, pass a People
+    page ID and relation_properties=["참여 프로젝트"] to follow that relation
+    to project pages. Any relation property name is accepted; the server
+    resolves relation IDs and keeps the traversal within the GH root.
+    """
+    if not page_ids:
+        raise ValueError("page_ids must contain at least one Notion page ID")
+    relation_properties = relation_properties or []
+    depth = min(max(depth, 0), 3)
+    max_pages = min(max(max_pages, 1), 100)
+    sections = sections or []
+
+    queue = [(page_id, 0) for page_id in dict.fromkeys(page_ids)]
+    seen: set[str] = set()
+    snapshots: list[dict] = []
+    edges: list[dict] = []
+    raw_pages: dict[str, dict] = {}
+
+    while queue and len(snapshots) < max_pages:
+        page_id, current_depth = queue.pop(0)
+        if page_id in seen:
+            continue
+        snapshot, raw_page = _page_snapshot(
+            page_id,
+            current_depth,
+            include_properties,
+            include_body,
+            sections,
+        )
+        seen.add(page_id)
+        snapshots.append(snapshot)
+        raw_pages[page_id] = raw_page
+
+        if current_depth >= depth:
+            continue
+        for property_name in relation_properties:
+            targets = _relation_ids(raw_page.get(property_name))
+            for target_id in targets:
+                edges.append({
+                    "from_id": page_id,
+                    "property": property_name,
+                    "to_id": target_id,
+                })
+                if target_id not in seen and len(seen) + len(queue) < max_pages:
+                    queue.append((target_id, current_depth + 1))
+
+    titles = {item["id"]: item["title"] for item in snapshots}
+    for edge in edges:
+        edge["from_title"] = titles.get(edge["from_id"])
+        edge["to_title"] = titles.get(edge["to_id"])
     return {
-        "이름": person.get("Name"),
-        "소속팀": person.get("소속팀"),
-        "직책": person.get("직책"),
-        "기수": person.get("기수"),
-        "참여_프로젝트": [project_names.get(pid, pid) for pid in project_ids],
-        "url": person.get("url"),
+        "pages": snapshots,
+        "edges": edges,
+        "truncated": bool(queue),
+        "max_pages": max_pages,
+    }
+
+
+def _content_snippet(title: str, body: str, query: str, width: int = 260) -> str:
+    haystack = f"{title}\n{body}"
+    folded = haystack.casefold()
+    needle = query.casefold().strip()
+    position = folded.find(needle) if needle else -1
+    if position < 0:
+        terms = [term for term in re.findall(r"[\w가-힣]+", needle) if term]
+        position = min((folded.find(term) for term in terms if folded.find(term) >= 0), default=0)
+    start = max(0, position - width // 2)
+    end = min(len(haystack), start + width)
+    prefix = "…" if start else ""
+    suffix = "…" if end < len(haystack) else ""
+    return prefix + haystack[start:end].strip() + suffix
+
+
+@mcp.tool()
+def search_notion_content(
+    query: str,
+    max_results: int = 20,
+    refresh: bool = False,
+    max_pages: int = 2000,
+    scan_budget_seconds: float = 20,
+    scope_keywords: list[str] | None = None,
+    scope_database: str = "",
+    scope_filters: list[dict] | None = None,
+) -> dict:
+    """Search keyword occurrences in supported non-People page titles and bodies.
+
+    Notion's native search is title-only, so this tool maintains an incremental
+    body cache in Supabase. The first call can be slow because it fetches all
+    scoped page bodies; later calls only re-fetch pages whose last-edited time
+    changed. Results include a short matching snippet and the page URL.
+
+    scan_budget_seconds limits work for one call. Use 0 for an unlimited scan;
+    an incomplete response can be called again to continue filling the cache.
+    scope_keywords restricts the scan to pages whose title (or ancestor title)
+    contains at least one keyword. For structured scoping, prefer
+    scope_database + scope_filters, e.g. Tasks with 종류=회의 and 담당부서
+    containing 운영진 or 회장단.
+    """
+    query = query.strip()
+    if not query:
+        raise ValueError("query must not be empty")
+    max_results = min(max(max_results, 1), 100)
+    max_pages = min(max(max_pages, 1), 5000)
+    scan_budget_seconds = max(float(scan_budget_seconds), 0)
+    scope_keywords = [item.casefold().strip() for item in (scope_keywords or []) if item.strip()]
+
+    if scope_database:
+        database_key, database_entry = _resolve_database(scope_database)
+        if database_key not in CONTENT_SEARCH_DATABASES:
+            raise ValueError(
+                f"Body search is not available for {database_key!r}. "
+                "Use query_database for People; People page bodies are excluded for privacy."
+            )
+        schema = _get_schema(database_key, database_entry)
+        properties = schema.get("properties", {})
+        compiled_filter = _compile_filters(scope_filters, properties)
+        rows = notion.query_database(
+            database_entry["data_source_id"],
+            filter_=compiled_filter,
+            max_rows=5000,
+        )
+        all_scope_pages = [
+            {
+                "object": "page",
+                "id": row["id"],
+                "title": _page_title(row),
+                "url": row.get("url"),
+                "parent": {"type": "database_id", "database_id": database_entry["database_id"]},
+                "last_edited_time": row.get("last_edited_time"),
+            }
+            for row in rows
+        ]
+        _known_notion_page_ids.update(page["id"] for page in all_scope_pages if page.get("id"))
+    else:
+        all_scope_pages = [
+            node for node in _get_notion_scope().values()
+            if node.get("object") == "page"
+            and (node.get("parent") or {}).get("database_id")
+            in {DATABASE_REGISTRY[key]["database_id"] for key in CONTENT_SEARCH_DATABASES}
+        ]
+
+    def matches_scope(node: dict) -> bool:
+        if not scope_keywords:
+            return True
+        current = node
+        visited: set[str] = set()
+        while current and current.get("id") not in visited:
+            current_id = current.get("id")
+            if current_id:
+                visited.add(current_id)
+            title = (current.get("title") or "").casefold()
+            if any(keyword in title for keyword in scope_keywords):
+                return True
+            parent_id = _parent_id(current)
+            current = _get_notion_scope().get(parent_id) if parent_id else None
+        return False
+
+    scope_pages = [node for node in all_scope_pages if matches_scope(node)][:max_pages]
+    # Make title matches available early even when the first full body scan is
+    # still in progress. Subsequent calls continue indexing the remaining
+    # pages and eventually make the body search complete.
+    query_folded = query.casefold()
+    scope_pages.sort(
+        key=lambda node: 0
+        if query_folded in (node.get("title") or "").casefold()
+        else 1
+    )
+    scope_by_id = {node["id"]: node for node in scope_pages}
+
+    # A content-policy revision is part of the cache marker.  It makes older
+    # project bodies (which may contain retrospective/letter sections) stale
+    # and prevents them from being returned while the safe body is refreshed.
+    def cache_marker(node: dict) -> str:
+        revision = "|project-body-safe-v1" if (node.get("parent") or {}).get("database_id") == DATABASE_REGISTRY["projects"]["database_id"] else ""
+        return f"{node.get('last_edited_time') or ''}{revision}"
+
+    expected_markers = {page_id: cache_marker(node) for page_id, node in scope_by_id.items()}
+
+    supabase.require_private()
+    cached_rows = supabase.select_all("ghbot_notion_content")
+    cached = {row["page_id"]: row.get("last_edited_time") for row in cached_rows}
+    started = time.monotonic()
+    scanned_this_call = 0
+    complete = True
+    for node in scope_pages:
+        page_id = node["id"]
+        current_edit = cache_marker(node)
+        if not refresh and page_id in cached and cached[page_id] == current_edit:
+            continue
+        if scan_budget_seconds and time.monotonic() - started >= scan_budget_seconds:
+            complete = False
+            break
+        try:
+            body = notion.fetch_page_text(page_id, max_blocks=1000)
+            if (node.get("parent") or {}).get("database_id") == DATABASE_REGISTRY["projects"]["database_id"]:
+                body = _strip_named_sections(body, ["개인별 회고", "편지"])
+        except (NotionAccessError, RuntimeError):
+            scanned_this_call += 1
+            continue
+        scanned_this_call += 1
+        supabase.upsert(
+            "ghbot_notion_content",
+            [{
+                "page_id": page_id,
+                "url": node.get("url"),
+                "title": node.get("title") or "(untitled)",
+                "body": body,
+                "last_edited_time": current_edit,
+            }],
+            on_conflict="page_id",
+        )
+
+    needle = query.casefold()
+    terms = [term.casefold() for term in re.findall(r"[\w가-힣]+", query)]
+    matches = []
+    current_rows = supabase.select_all("ghbot_notion_content")
+    for row in current_rows:
+        page_id = row["page_id"]
+        # A scoped interactive search may update only a small slice of the
+        # cache.  Keep other slices for reuse, but never let them leak into
+        # this query's result set.
+        if page_id not in scope_by_id or row.get("last_edited_time") != expected_markers[page_id]:
+            continue
+        title = row.get("title") or ""
+        body = row.get("body") or ""
+        title_folded = title.casefold()
+        body_folded = body.casefold()
+        phrase_in_title = needle in title_folded
+        phrase_in_body = needle in body_folded
+        term_hits = sum(term in title_folded or term in body_folded for term in terms)
+        if not phrase_in_title and not phrase_in_body and term_hits < len(terms):
+            continue
+        score = (4 if phrase_in_title else 0) + (3 if phrase_in_body else 0) + term_hits
+        matches.append({
+            "page_id": page_id,
+            "url": row.get("url") or scope_by_id.get(page_id, {}).get("url"),
+            "title": title,
+            "match": "title_and_body" if phrase_in_title and phrase_in_body else "title" if phrase_in_title else "body",
+            "snippet": _content_snippet(title, body, query),
+            "score": score,
+            "last_edited_time": scope_by_id[page_id].get("last_edited_time"),
+        })
+    return {
+        "results": sorted(matches, key=lambda item: (-item["score"], item["title"] or ""))[:max_results],
+        "complete": complete,
+        "indexed_pages": len(current_rows),
+        "scanned_this_call": scanned_this_call,
+        "total_pages": len(scope_pages),
+        "scan_budget_seconds": scan_budget_seconds,
+        "scope_keywords": scope_keywords,
+        "scope_database": scope_database or None,
+        "scope_filters": scope_filters or [],
     }
 
 
@@ -233,16 +1192,14 @@ def search_drive(query: str, team: str = "") -> list[dict]:
     results = drive.search(query, page_size=20)
 
     if team and team in TEAM_FOLDERS:
-        conn = sqlite3.connect(EMBED_DB_PATH)
-        try:
-            allowed_ids = {
-                row[0]
-                for row in conn.execute("SELECT file_id FROM drive_files WHERE team = ?", (team,))
-            }
-        except sqlite3.OperationalError:
-            allowed_ids = set()
-        finally:
-            conn.close()
+        allowed_ids = {
+            row["file_id"]
+            for row in supabase.select(
+                "ghbot_drive_files",
+                columns="file_id",
+                filters=[("team", f"eq.{team}")],
+            )
+        } if supabase.private_enabled else set()
         if allowed_ids:
             results = [r for r in results if r["id"] in allowed_ids]
         else:
@@ -285,59 +1242,93 @@ def read_spreadsheet(file_id: str, sheet_name: str = "") -> str:
 
 
 _embed_model: TextEmbedding | None = None
-_chunk_cache: list[dict] | None = None
 
 
 def _load_semantic_index():
-    global _embed_model, _chunk_cache
+    global _embed_model
     if _embed_model is None:
         _embed_model = TextEmbedding(model_name=EMBED_MODEL_NAME)
-    if _chunk_cache is None:
-        conn = sqlite3.connect(EMBED_DB_PATH)
-        rows = conn.execute(
-            "SELECT page_id, url, title, source_label, chunk_text, embedding, last_edited FROM chunks"
-        ).fetchall()
-        conn.close()
-        _chunk_cache = [
-            {
-                "page_id": page_id,
-                "url": url,
-                "title": title,
-                "source_label": source_label,
-                "chunk_text": chunk_text,
-                "vector": np.frombuffer(embedding, dtype="float32"),
-                "last_edited": last_edited,
-            }
-            for page_id, url, title, source_label, chunk_text, embedding, last_edited in rows
-        ]
-    return _embed_model, _chunk_cache
+    supabase.require_private()
+    rows = supabase.select_all(
+        "ghbot_chunks",
+        columns="page_id,url,title,source_label,chunk_text,embedding,last_edited,chunk_index",
+    )
+    chunks = [
+        {
+            "page_id": row["page_id"],
+            "url": row.get("url"),
+            "title": row.get("title"),
+            "source_label": row.get("source_label", ""),
+            "chunk_text": row.get("chunk_text", ""),
+            "vector": np.asarray(row.get("embedding") or [], dtype="float32"),
+            "last_edited": row.get("last_edited"),
+        }
+        for row in rows
+        if row.get("embedding")
+    ]
+    return _embed_model, chunks
 
 
 @mcp.tool()
 def semantic_search(query: str, top_k: int = 5, source: str = "") -> list[dict]:
-    """Search embedded Notion (whitepapers, in-progress projects) and Google Drive
-    (official team documents) content together by meaning, not keywords.
+    """Hybrid keyword + semantic search across indexed Notion content.
 
     Use for questions that need synthesis across documents or don't map to a
     clean field/tag. Does NOT yet cover meeting notes. Optional `source` filters
     to a label prefix, e.g. '프로젝트_백서', '진행중_프로젝트', or '구글드라이브_HR'.
-    Each result includes `last_edited` - when several results share a title
-    (e.g. old 정관 copies), trust the most recently edited one.
+    Exact term matches and vector similarity are fused with reciprocal-rank
+    fusion. Each result includes both component scores and `last_edited`.
     """
     model, chunks = _load_semantic_index()
     if not chunks:
         return []
     query_vec = next(model.embed([query]))
-    pool = [c for c in chunks if not source or c["source_label"].startswith(source)]
+    pool = [
+        c
+        for c in chunks
+        if not c["source_label"].startswith("프로젝트_백서(Archive)")
+        and not c["source_label"].startswith("구글드라이브_")
+        and (not source or c["source_label"].startswith(source))
+    ]
 
     def cos_sim(a, b):
         return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
-    scored = sorted(
-        ({**c, "score": cos_sim(query_vec, c["vector"])} for c in pool),
-        key=lambda c: c["score"],
+    semantic_ranked = sorted(
+        ({**c, "semantic_score": cos_sim(query_vec, c["vector"])} for c in pool),
+        key=lambda c: c["semantic_score"],
         reverse=True,
-    )[:top_k]
+    )
+
+    query_terms = set(re.findall(r"[\w가-힣]+", query.lower()))
+
+    def lexical_score(item):
+        haystack = f"{item['title']} {item['chunk_text']}".lower()
+        term_hits = sum(haystack.count(term) for term in query_terms)
+        phrase_hit = 1 if query.strip().lower() in haystack else 0
+        return float(term_hits + (phrase_hit * 2))
+
+    lexical_ranked = sorted(
+        ({**c, "lexical_score": lexical_score(c)} for c in pool),
+        key=lambda c: c["lexical_score"],
+        reverse=True,
+    )
+    # Rank chunks by identity, not only page ID: a document may have several
+    # chunks and each can be useful evidence for a different query.
+    def identity(item):
+        return (item["page_id"], item["chunk_text"])
+    semantic_positions = {identity(c): i for i, c in enumerate(semantic_ranked)}
+    lexical_positions = {identity(c): i for i, c in enumerate(lexical_ranked) if c["lexical_score"] > 0}
+    lexical_scores = {identity(c): c["lexical_score"] for c in lexical_ranked}
+    fused = []
+    for item in semantic_ranked:
+        key = identity(item)
+        lexical_score_value = lexical_scores.get(key, 0.0)
+        rrf = 0.65 / (60 + semantic_positions[key] + 1)
+        if key in lexical_positions:
+            rrf += 0.35 / (60 + lexical_positions[key] + 1)
+        fused.append({**item, "lexical_score": lexical_score_value, "score": rrf})
+    scored = sorted(fused, key=lambda c: c["score"], reverse=True)[:top_k]
     return [
         {
             "page_id": c["page_id"],
@@ -345,7 +1336,9 @@ def semantic_search(query: str, top_k: int = 5, source: str = "") -> list[dict]:
             "title": c["title"],
             "source_label": c["source_label"],
             "text": c["chunk_text"],
-            "score": round(c["score"], 3),
+            "score": round(c["score"], 5),
+            "semantic_score": round(c["semantic_score"], 3),
+            "lexical_score": round(c["lexical_score"], 3),
             "last_edited": c["last_edited"],
         }
         for c in scored
