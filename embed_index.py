@@ -274,7 +274,9 @@ class Indexer:
             )
         self.conn.execute(
             "INSERT INTO pages (page_id, source_label, last_edited_time) VALUES (?, ?, ?) "
-            "ON CONFLICT(page_id) DO UPDATE SET last_edited_time = excluded.last_edited_time",
+            "ON CONFLICT(page_id) DO UPDATE SET "
+            "source_label = excluded.source_label, "
+            "last_edited_time = excluded.last_edited_time",
             (doc_id, label, edited),
         )
         self.conn.commit()  # commit per document so a later crash doesn't lose earlier progress
