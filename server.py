@@ -1405,10 +1405,10 @@ async def login(request):
     form = await request.form()
     params = dict(form)
     token = (params.get("token") or "").strip()
-    members = oauth_provider.load_members()
-    member_name = members.get(token)
-    if not member_name:
+    resolved_member = await oauth_provider.resolve_member_token(token)
+    if not resolved_member:
         return HTMLResponse(_login_page(params, error="토큰이 올바르지 않습니다."), status_code=401)
+    subject, _member_name = resolved_member
 
     code = "ghcode_" + _secrets.token_urlsafe(24)
     conn = oauth_provider.connect()
@@ -1424,7 +1424,7 @@ async def login(request):
             params.get("redirect_uri", ""),
             1,
             params.get("resource") or None,
-            member_name,
+            subject,
         ),
     )
     conn.commit()
@@ -1466,7 +1466,9 @@ def _build_http_app():
     )
 
     members = load_members()
-    print(f"[gh-notion-bot] {len(members)} legacy static token(s), OAuth login at /login, serving at /mcp")
+    admin_auth_enabled = bool(os.environ.get("ADMIN_API_URL") and os.environ.get("GHBOT_AUTH_SHARED_SECRET"))
+    source = "admin token verification enabled" if admin_auth_enabled else "admin token verification disabled"
+    print(f"[gh-notion-bot] {len(members)} legacy static token(s), {source}, OAuth login at /login, serving at /mcp")
     return mcp.streamable_http_app(
         streamable_http_path=os.environ.get("MCP_PATH", "/mcp"),
         transport_security=transport_security,
