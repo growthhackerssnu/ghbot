@@ -62,6 +62,21 @@ SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_KEY=your-private-backend-key
 ```
 
+### Admin-managed member tokens
+
+`MEMBERS_JSON` remains supported for existing static tokens. To validate tokens
+issued by the admin service without exposing the admin Supabase database to
+Railway, set the following on the ghbot service:
+
+```text
+ADMIN_API_URL=https://<admin-api-domain>
+GHBOT_AUTH_SHARED_SECRET=<same random value configured on the admin backend>
+```
+
+The ghbot server sends a token or token hash only to the admin backend's
+internal verification endpoint. The backend compares its SHA-256 hash against
+an active acting-member token, so a revoked token stops working immediately.
+
 `MEMBERS_JSON` is required for the remote deployment - the server refuses to
 start over HTTP with no members configured rather than serving real Notion/Drive
 data to anyone who finds the URL. Generate member tokens locally with:
