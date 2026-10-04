@@ -1,0 +1,60 @@
+# main에 push되면 이미지를 빌드해 Cloud Run에 배포한다.
+# GCP 인증은 Workload Identity Federation이라 저장소에 키 파일이 없다.
+# 환경변수·시크릿은 Cloud Run 서비스에 직접 설정돼 있고, 여기선 이미지만 바꾼다.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - railway.json
+      - railway.sync.json
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION }}
+  SERVICE: ghbot
+  IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/ghbot/ghbot:${{ github.sha }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - run: gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+
+      - run: docker build -t "$IMAGE" . && docker push "$IMAGE"
+
+      - uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE }}
+          region: ${{ env.REGION }}
+          image: ${{ env.IMAGE }}
+          # MCP는 앱이 자체 OAuth/토큰 인증을 한다. Cloud Run 단에선 공개.
+          # OAuth 상태는 admin Postgres(ghbot.oauth_entries), MCP는 stateless라
+          # 인스턴스가 0으로 내려가도 claude.ai 연결이 유지된다.
+          flags: >-
+            --service-account=ghbot-run@${{ env.PROJECT_ID }}.iam.gserviceaccount.com
+            --allow-unauthenticated
+            --timeout=300
+            --cpu-boost
+            --memory=1Gi
+            --min-instances=0
+            --max-instances=3

@@ -1389,7 +1389,6 @@ def _login_page(params, error: str = "") -> str:
 
 @mcp.custom_route("/login", methods=["GET", "POST"])
 async def login(request):
-    import json as _json
     import secrets as _secrets
     import time as _time
     from urllib.parse import urlencode
@@ -1411,24 +1410,19 @@ async def login(request):
     subject, _member_name = resolved_member
 
     code = "ghcode_" + _secrets.token_urlsafe(24)
-    conn = oauth_provider.connect()
-    conn.execute(
-        "INSERT INTO oauth_codes (code, client_id, scopes, expires_at, code_challenge, redirect_uri, "
-        "redirect_uri_explicit, resource, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            code,
-            params.get("client_id", ""),
-            _json.dumps((params.get("scope") or "").split()),
-            _time.time() + oauth_provider.CODE_TTL_SECONDS,
-            params.get("code_challenge", ""),
-            params.get("redirect_uri", ""),
-            1,
-            params.get("resource") or None,
-            subject,
-        ),
+    await oauth_provider.save_authorization_code(
+        code,
+        {
+            "client_id": params.get("client_id", ""),
+            "scopes": (params.get("scope") or "").split(),
+            "expires_at": _time.time() + oauth_provider.CODE_TTL_SECONDS,
+            "code_challenge": params.get("code_challenge", ""),
+            "redirect_uri": params.get("redirect_uri", ""),
+            "redirect_uri_explicit": True,
+            "resource": params.get("resource") or None,
+            "subject": subject,
+        },
     )
-    conn.commit()
-    conn.close()
 
     redirect_uri = params.get("redirect_uri", "")
     sep = "&" if "?" in redirect_uri else "?"
@@ -1472,6 +1466,9 @@ def _build_http_app():
     return mcp.streamable_http_app(
         streamable_http_path=os.environ.get("MCP_PATH", "/mcp"),
         transport_security=transport_security,
+        # 세션을 메모리에 두지 않는다. Cloud Run이 인스턴스를 내리거나 늘려도
+        # 연결이 깨지지 않게. 서버->클라이언트 푸시(sampling/elicitation)는 안 쓴다.
+        stateless_http=True,
     )
 
 

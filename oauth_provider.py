@@ -13,7 +13,6 @@ import hashlib
 import json
 import os
 import secrets
-import sqlite3
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -23,16 +22,20 @@ from config import load_json_env
 from mcp.server.auth.provider import AccessToken, AuthorizationCode, AuthorizationParams, RefreshToken
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-DB_PATH = Path(__file__).parent / "oauth.db"
 CODE_TTL_SECONDS = 300
 ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 180  # 180 days - low-stakes internal tool, avoid re-login churn
 ADMIN_TOKEN_SUBJECT_PREFIX = "admin-token:"
 
 
-def _admin_auth_url() -> str | None:
+def _admin_url(path: str) -> str | None:
     base_url = os.environ.get("ADMIN_API_URL", "").rstrip("/")
     secret = os.environ.get("GHBOT_AUTH_SHARED_SECRET", "")
-    return f"{base_url}/api/v1/internal/ghbot/authenticate" if base_url and secret else None
+    return f"{base_url}{path}" if base_url and secret else None
+
+
+def _admin_timeout() -> float:
+    # admin은 Cloud Run에서 0까지 내려가므로 콜드 스타트(수 초)를 견딜 만큼 넉넉히.
+    return float(os.environ.get("GHBOT_AUTH_TIMEOUT_SECONDS", "10"))
 
 
 async def _verify_admin_token(*, token: str | None = None, token_hash: str | None = None) -> str | None:
@@ -43,7 +46,7 @@ async def _verify_admin_token(*, token: str | None = None, token_hash: str | Non
     token is sent only for direct bearer authentication, while OAuth-issued
     sessions use the token hash saved in their subject.
     """
-    url = _admin_auth_url()
+    url = _admin_url("/api/v1/internal/ghbot/authenticate")
     if not url:
         return None
     payload = {"token": token} if token is not None else {"tokenHash": token_hash}
@@ -61,7 +64,7 @@ async def _verify_admin_token(*, token: str | None = None, token_hash: str | Non
 
     def send() -> str | None:
         try:
-            with urlopen(request, timeout=float(os.environ.get("GHBOT_AUTH_TIMEOUT_SECONDS", "3"))) as response:
+            with urlopen(request, timeout=_admin_timeout()) as response:
                 data = json.loads(response.read().decode("utf-8"))
             display_name = data.get("data", {}).get("displayName")
             return display_name if isinstance(display_name, str) and display_name else None
@@ -94,25 +97,47 @@ async def resolve_admin_subject(subject: str) -> str | None:
     return await _verify_admin_token(token_hash=token_hash)
 
 
-def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("CREATE TABLE IF NOT EXISTS oauth_clients (client_id TEXT PRIMARY KEY, data TEXT)")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS oauth_codes (
-            code TEXT PRIMARY KEY, client_id TEXT, scopes TEXT, expires_at REAL,
-            code_challenge TEXT, redirect_uri TEXT, redirect_uri_explicit INTEGER,
-            resource TEXT, subject TEXT
-        )"""
+def _secret_key(kind: str, value: str) -> str:
+    # 코드·토큰 원문은 admin DB에 남기지 않는다. 조회 키로 해시만 보낸다.
+    return f"{kind}:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+
+
+async def store(op: str, key: str, data: dict | None = None, expires_at: float | None = None) -> dict | None:
+    """OAuth 상태를 admin의 ghbot.oauth_entries(Postgres)에 읽고 쓴다.
+
+    예전엔 컨테이너 디스크의 oauth.db(SQLite)였는데, 인스턴스가 내려가면 모든
+    claude.ai 연결이 끊겼다. ghbot은 DB 접속 정보를 받지 않으므로 내부 API로만 접근한다.
+    전송 오류는 예외로 올린다 — 여기서 None을 돌려주면 '토큰 없음'(401)이 되어
+    사용자가 다시 로그인해야 하지만, 예외(500)면 클라이언트가 그냥 재시도한다.
+    """
+    url = _admin_url("/api/v1/internal/ghbot/oauth-store")
+    if not url:
+        raise RuntimeError("ADMIN_API_URL and GHBOT_AUTH_SHARED_SECRET must be set for OAuth storage")
+    payload: dict = {"op": op, "key": key}
+    if data is not None:
+        payload["data"] = data
+    if expires_at is not None:
+        payload["expiresAt"] = expires_at
+    request = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "x-ghbot-auth-secret": os.environ["GHBOT_AUTH_SHARED_SECRET"],
+        },
     )
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS oauth_tokens (
-            access_token TEXT PRIMARY KEY, refresh_token TEXT, client_id TEXT,
-            scopes TEXT, expires_at REAL, resource TEXT, subject TEXT
-        )"""
-    )
-    conn.commit()
-    return conn
+
+    def send() -> dict | None:
+        with urlopen(request, timeout=_admin_timeout()) as response:
+            return json.loads(response.read().decode("utf-8")).get("data", {}).get("value")
+
+    return await asyncio.to_thread(send)
+
+
+async def save_authorization_code(code: str, record: dict) -> None:
+    await store("put", _secret_key("code", code), record, record["expires_at"])
 
 
 def load_members() -> dict[str, str]:
@@ -130,20 +155,11 @@ class MemberOAuthProvider:
     protocol (duck-typed, not inherited - it's a typing.Protocol)."""
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        conn = connect()
-        row = conn.execute("SELECT data FROM oauth_clients WHERE client_id = ?", (client_id,)).fetchone()
-        conn.close()
-        return OAuthClientInformationFull.model_validate_json(row[0]) if row else None
+        data = await store("get", f"client:{client_id}")
+        return OAuthClientInformationFull.model_validate(data) if data else None
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        conn = connect()
-        conn.execute(
-            "INSERT INTO oauth_clients (client_id, data) VALUES (?, ?) "
-            "ON CONFLICT(client_id) DO UPDATE SET data = excluded.data",
-            (client_info.client_id, client_info.model_dump_json()),
-        )
-        conn.commit()
-        conn.close()
+        await store("put", f"client:{client_info.client_id}", client_info.model_dump(mode="json"))
 
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
         from urllib.parse import urlencode
@@ -164,115 +180,75 @@ class MemberOAuthProvider:
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str
     ) -> AuthorizationCode | None:
-        conn = connect()
-        row = conn.execute(
-            "SELECT client_id, scopes, expires_at, code_challenge, redirect_uri, "
-            "redirect_uri_explicit, resource, subject FROM oauth_codes WHERE code = ?",
-            (authorization_code,),
-        ).fetchone()
-        conn.close()
-        if not row:
-            return None
-        client_id, scopes, expires_at, code_challenge, redirect_uri, redirect_explicit, resource, subject = row
-        if expires_at < time.time():
+        row = await store("get", _secret_key("code", authorization_code))
+        if not row or row["expires_at"] < time.time():
             return None
         return AuthorizationCode(
             code=authorization_code,
-            scopes=json.loads(scopes),
-            expires_at=expires_at,
-            client_id=client_id,
-            code_challenge=code_challenge,
-            redirect_uri=redirect_uri,
-            redirect_uri_provided_explicitly=bool(redirect_explicit),
-            resource=resource or None,
-            subject=subject,
+            scopes=row["scopes"],
+            expires_at=row["expires_at"],
+            client_id=row["client_id"],
+            code_challenge=row["code_challenge"],
+            redirect_uri=row["redirect_uri"],
+            redirect_uri_provided_explicitly=bool(row["redirect_uri_explicit"]),
+            resource=row.get("resource") or None,
+            subject=row.get("subject"),
         )
 
-    async def exchange_authorization_code(
-        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
-    ) -> OAuthToken:
-        conn = connect()
-        conn.execute("DELETE FROM oauth_codes WHERE code = ?", (authorization_code.code,))
+    async def _issue_tokens(self, client_id: str, scopes: list[str], resource: str | None, subject: str | None) -> OAuthToken:
         access_token = "ghoauth_" + secrets.token_urlsafe(32)
         refresh_token = "ghrefresh_" + secrets.token_urlsafe(32)
         expires_at = time.time() + ACCESS_TOKEN_TTL_SECONDS
-        conn.execute(
-            "INSERT INTO oauth_tokens (access_token, refresh_token, client_id, scopes, expires_at, resource, subject) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                access_token,
-                refresh_token,
-                client.client_id,
-                json.dumps(authorization_code.scopes),
-                expires_at,
-                authorization_code.resource,
-                authorization_code.subject,
-            ),
-        )
-        conn.commit()
-        conn.close()
+        access_key = _secret_key("access", access_token)
+        refresh_key = _secret_key("refresh", refresh_token)
+        record = {"client_id": client_id, "scopes": scopes, "expires_at": expires_at, "resource": resource, "subject": subject}
+        await store("put", access_key, {**record, "refresh_key": refresh_key}, expires_at)
+        await store("put", refresh_key, {**record, "access_key": access_key}, expires_at)
         return OAuthToken(
             access_token=access_token,
             token_type="Bearer",
             expires_in=ACCESS_TOKEN_TTL_SECONDS,
             refresh_token=refresh_token,
-            scope=" ".join(authorization_code.scopes) if authorization_code.scopes else None,
+            scope=" ".join(scopes) if scopes else None,
+        )
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        await store("delete", _secret_key("code", authorization_code.code))
+        return await self._issue_tokens(
+            client.client_id, authorization_code.scopes, authorization_code.resource, authorization_code.subject
         )
 
     async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> RefreshToken | None:
-        conn = connect()
-        row = conn.execute(
-            "SELECT client_id, scopes, expires_at, resource FROM oauth_tokens WHERE refresh_token = ?",
-            (refresh_token,),
-        ).fetchone()
-        conn.close()
+        row = await store("get", _secret_key("refresh", refresh_token))
         if not row:
             return None
-        client_id, scopes, expires_at, resource = row
         return RefreshToken(
             token=refresh_token,
-            client_id=client_id,
-            scopes=json.loads(scopes),
-            expires_at=int(expires_at) if expires_at else None,
-            resource=resource,
+            client_id=row["client_id"],
+            scopes=row["scopes"],
+            expires_at=int(row["expires_at"]) if row.get("expires_at") else None,
+            resource=row.get("resource"),
         )
 
     async def exchange_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]
     ) -> OAuthToken:
-        conn = connect()
-        row = conn.execute("SELECT subject FROM oauth_tokens WHERE refresh_token = ?", (refresh_token.token,)).fetchone()
-        conn.execute("DELETE FROM oauth_tokens WHERE refresh_token = ?", (refresh_token.token,))
-        access_token = "ghoauth_" + secrets.token_urlsafe(32)
-        new_refresh = "ghrefresh_" + secrets.token_urlsafe(32)
-        expires_at = time.time() + ACCESS_TOKEN_TTL_SECONDS
-        use_scopes = scopes or refresh_token.scopes
-        conn.execute(
-            "INSERT INTO oauth_tokens (access_token, refresh_token, client_id, scopes, expires_at, resource, subject) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (access_token, new_refresh, client.client_id, json.dumps(use_scopes), expires_at, refresh_token.resource, row[0] if row else None),
-        )
-        conn.commit()
-        conn.close()
-        return OAuthToken(
-            access_token=access_token,
-            token_type="Bearer",
-            expires_in=ACCESS_TOKEN_TTL_SECONDS,
-            refresh_token=new_refresh,
-            scope=" ".join(use_scopes) if use_scopes else None,
+        # take = 조회+삭제 한 번에. 같은 리프레시 토큰을 두 번 써도 한 번만 교환된다.
+        row = await store("take", _secret_key("refresh", refresh_token.token))
+        if row and row.get("access_key"):
+            await store("delete", row["access_key"])
+        return await self._issue_tokens(
+            client.client_id, scopes or refresh_token.scopes, refresh_token.resource, row.get("subject") if row else None
         )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        conn = connect()
-        row = conn.execute(
-            "SELECT client_id, scopes, expires_at, resource, subject FROM oauth_tokens WHERE access_token = ?",
-            (token,),
-        ).fetchone()
-        conn.close()
+        row = await store("get", _secret_key("access", token))
         if row:
-            client_id, scopes, expires_at, resource, subject = row
-            if expires_at < time.time():
+            if row["expires_at"] < time.time():
                 return None
+            subject = row.get("subject")
             # Admin-issued OAuth sessions retain a token-hash subject and are
             # revalidated on every request. Older static OAuth sessions may
             # have a name (or NULL from the historical refresh implementation)
@@ -283,10 +259,10 @@ class MemberOAuthProvider:
                     return None
             return AccessToken(
                 token=token,
-                client_id=client_id,
-                scopes=json.loads(scopes),
-                expires_at=int(expires_at),
-                resource=resource,
+                client_id=row["client_id"],
+                scopes=row["scopes"],
+                expires_at=int(row["expires_at"]),
+                resource=row.get("resource"),
                 subject=subject,
             )
         # Legacy static tokens remain valid during migration. Tokens issued by
@@ -298,9 +274,9 @@ class MemberOAuthProvider:
         return None
 
     async def revoke_token(self, token) -> None:
-        conn = connect()
-        conn.execute(
-            "DELETE FROM oauth_tokens WHERE access_token = ? OR refresh_token = ?", (token.token, token.token)
-        )
-        conn.commit()
-        conn.close()
+        # 액세스·리프레시 어느 쪽으로 폐기해도 짝까지 같이 지운다.
+        for kind, pair_field in (("access", "refresh_key"), ("refresh", "access_key")):
+            key = _secret_key(kind, token.token)
+            row = await store("take", key)
+            if row and row.get(pair_field):
+                await store("delete", row[pair_field])
