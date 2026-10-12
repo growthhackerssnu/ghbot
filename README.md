@@ -1,6 +1,6 @@
 # ghbot
 
-Growth Hackers Notion + Google Drive MCP server.
+Growth Hackers Notion + Google Drive + Slack MCP server.
 
 ## Run locally
 
@@ -31,28 +31,69 @@ index access after RLS is enabled. Never commit any Supabase key.
 
 The repository includes [`sync_worker.py`](sync_worker.py), a short-lived job
 that hydrates the staging index from Supabase, incrementally fetches changed
-Notion project pages and Tasks/meeting notes, publishes the result, and exits. Create a separate
-Railway service from this repository for the worker; keep the existing web
-service on `railway.json`. Use [`railway.sync.json`](railway.sync.json) as the
-worker service configuration, or set these values in Railway's service
-settings:
+Notion project pages and Tasks/meeting notes, publishes the result, then
+syncs Slack (see below) and exits.
+In production it runs as the Cloud Run Job `ghbot-sync`, using the same image as
+the web service, and Cloud Scheduler starts it daily at 03:00 KST. The deploy
+workflow keeps the job's image up to date. The job and scheduler need this
+one-time setup:
 
-```text
-Start command: python sync_worker.py
-Cron schedule: 0 18 * * *
+```bash
+REGION=<region>; PROJECT=<project-id>; SA=ghbot-run@$PROJECT.iam.gserviceaccount.com
+IMAGE=$(gcloud run services describe ghbot --region=$REGION --format='value(spec.template.spec.containers[0].image)')
+
+# Sync needs Notion, Supabase and the Slack token key (Drive is not embedded).
+gcloud run jobs create ghbot-sync --region=$REGION --image=$IMAGE \
+  --command=python --args=sync_worker.py \
+  --service-account=$SA --memory=2Gi --task-timeout=7200 --max-retries=0 \
+  --set-env-vars=SUPABASE_URL=https://<ghbot-project>.supabase.co \
+  --set-secrets=NOTION_API_KEY=GHBOT_NOTION_API_KEY:latest,SUPABASE_KEY=GHBOT_SUPABASE_KEY:latest,SLACK_TOKEN_ENCRYPTION_KEY=GHBOT_SLACK_TOKEN_ENCRYPTION_KEY:latest
+
+gcloud run jobs add-iam-policy-binding ghbot-sync --region=$REGION \
+  --member=serviceAccount:$SA --role=roles/run.invoker
+
+gcloud scheduler jobs create http ghbot-sync-daily --location=$REGION \
+  --schedule="0 3 * * *" --time-zone="Asia/Seoul" --http-method=POST \
+  --uri="https://run.googleapis.com/v2/projects/$PROJECT/locations/$REGION/jobs/ghbot-sync:run" \
+  --oauth-service-account-email=$SA
 ```
 
-Railway schedules in UTC, so this runs daily at 03:00 KST. Copy the same
-`NOTION_API_KEY`, Google credentials, and private `SUPABASE_URL`/
-`SUPABASE_KEY` variables to the worker service. The first run can instead use
-`python sync_worker.py --upload-only` to publish an existing `gh_bot.db`.
+Run it by hand with `gcloud run jobs execute ghbot-sync --region=$REGION`. The
+first run can instead use `python sync_worker.py --upload-only` locally to
+publish an existing `gh_bot.db`.
 
-## Deploy on Railway
+### Slack
 
-Railway runs the server over Streamable HTTP at `/mcp`. The repository includes
-`railway.json`, which configures the start command and `/health` health check.
+Slack has no bot to invite. Each member connects their own Slack account once
+(ask Claude to "connect Slack" - the `connect_slack` tool returns the link),
+and ghbot stores that user token encrypted in `ghbot_slack_users`.
 
-Set these Railway service variables before deploying:
+- **Sync:** the nightly job lists every connected member's conversations
+  (public, private, group DMs, DMs), crawls each one once, and stores threads
+  and per-day message groups as embedded chunks in `ghbot_slack_chunks`. The
+  last 14 days are re-read each night for edits, deletions and new replies.
+  The first backfill stops after `SLACK_SYNC_BUDGET_SECONDS` (default 3000)
+  and resumes the next night; for a one-off long run use
+  `gcloud run jobs execute ghbot-sync --args=sync_worker.py,--slack-only,--slack-budget=20000 --task-timeout=21600`.
+- **Access:** `search_slack` asks Slack, with the caller's own token, which
+  conversations they are in right now, and the database function
+  `ghbot_match_slack` only returns chunks from those (plus public channels for
+  non-guests). A DM between A and B is searchable by A and B only.
+  `fetch_slack_thread` reads threads live with the caller's token.
+
+Setup: create the app from [`slack_app_manifest.yml`](slack_app_manifest.yml)
+at api.slack.com/apps, rerun [`supabase_schema.sql`](supabase_schema.sql),
+then set `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_TEAM_ID` and
+`SLACK_TOKEN_ENCRYPTION_KEY` on the service, and `SLACK_TOKEN_ENCRYPTION_KEY`
+on the job.
+
+## Deploy on Cloud Run
+
+Pushes to `main` build the image and deploy the `ghbot` Cloud Run service via
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml). The server
+runs over Streamable HTTP at `/mcp`, with a `/health` check. Environment
+variables are set on the Cloud Run service directly; the workflow only swaps
+the image:
 
 ```text
 NOTION_API_KEY=your_notion_integration_secret
@@ -66,7 +107,7 @@ SUPABASE_KEY=your-private-backend-key
 
 `MEMBERS_JSON` remains supported for existing static tokens. To validate tokens
 issued by the admin service without exposing the admin Supabase database to
-Railway, set the following on the ghbot service:
+Cloud Run, set the following on the ghbot service:
 
 ```text
 ADMIN_API_URL=https://<admin-api-domain>
@@ -86,13 +127,13 @@ python manage_members.py add "member name"
 ```
 
 then copy the resulting `{token: name}` pairs into `MEMBERS_JSON` (a plain
-`members.json` file also works for local runs, but Railway has no persistent/
+`members.json` file also works for local runs, but Cloud Run has no persistent/
 committed filesystem for secrets, hence the env var form).
 
-After Railway generates a public domain, connect your MCP client to:
+Connect your MCP client to:
 
 ```text
-https://your-domain.up.railway.app/mcp
+https://api.ghsnu.com/mcp
 ```
 
 with an `Authorization: Bearer <member token>` header (Claude and ChatGPT

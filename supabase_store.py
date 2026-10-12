@@ -159,3 +159,13 @@ class SupabaseStore:
     def delete(self, table: str, filters: list[tuple[str, str]]) -> None:
         self.require_write_enabled()
         self._request("DELETE", table, params=filters, prefer="return=minimal")
+
+    def update(self, table: str, values: dict, filters: list[tuple[str, str]]) -> None:
+        self.require_write_enabled()
+        self._request("PATCH", table, params=filters, body=values, prefer="return=minimal")
+
+    def rpc(self, function: str, args: dict) -> list[dict]:
+        """Call a Postgres function; arguments travel in the body, not the URL."""
+        self.require_private()
+        result = self._request("POST", f"rpc/{function}", body=args)
+        return result if isinstance(result, list) else []

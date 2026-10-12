@@ -1,0 +1,24 @@
+# Slack 앱 생성: https://api.slack.com/apps -> Create New App -> From a manifest
+# 봇 사용자 없이 사용자 토큰만 쓴다. 각 멤버가 connect_slack 링크로 본인 계정을
+# 연결하면, 그 사람이 Slack에서 볼 수 있는 대화(DM 포함)만 검색된다.
+display_information:
+  name: ghbot
+  description: GH 노션·드라이브·슬랙을 Claude에서 함께 검색
+oauth_config:
+  redirect_urls:
+    - https://api.ghsnu.com/slack/oauth/callback
+  scopes:
+    user:
+      - channels:history
+      - channels:read
+      - groups:history
+      - groups:read
+      - im:history
+      - im:read
+      - mpim:history
+      - mpim:read
+      - users:read
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

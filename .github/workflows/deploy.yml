@@ -8,8 +8,6 @@ on:
     branches: [main]
     paths-ignore:
       - "**.md"
-      - railway.json
-      - railway.sync.json
   workflow_dispatch:
 
 concurrency:
@@ -58,3 +56,13 @@ jobs:
             --memory=1Gi
             --min-instances=0
             --max-instances=3
+
+      # 매일 노션 -> Supabase 인덱스를 갱신하는 Cloud Run Job(ghbot-sync)도 같은
+      # 이미지로 맞춘다. 잡 생성·환경변수·스케줄러는 README의 1회성 설정을 따른다.
+      - name: Update sync job image
+        run: |
+          if gcloud run jobs describe ghbot-sync --region="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1; then
+            gcloud run jobs update ghbot-sync --region="$REGION" --project="$PROJECT_ID" --image="$IMAGE"
+          else
+            echo "::warning::Cloud Run Job ghbot-sync가 없어 건너뜀 (README 'Daily sync' 참고)"
+          fi

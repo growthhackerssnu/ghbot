@@ -1,6 +1,5 @@
 .env
 *.json
-!railway.json
 __pycache__/
 *.pyc
 .venv/

@@ -71,7 +71,7 @@ class DriveAccessError(RuntimeError):
 class DriveClient:
     def __init__(self, service_account_file: str | None = None):
         # GOOGLE_SERVICE_ACCOUNT_JSON (inline key content) takes priority - for
-        # platforms like Railway with no committed/persistent filesystem, set
+        # platforms like Cloud Run with no committed/persistent filesystem, set
         # this as a secret env var instead of shipping the key file. Falls
         # back to a local file path for local dev.
         info = load_json_env("GOOGLE_SERVICE_ACCOUNT_JSON")

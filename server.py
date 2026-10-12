@@ -21,6 +21,7 @@ from notion_client import (
 from drive_client import DriveClient, TEAM_FOLDERS
 from config import load_env_file
 from supabase_store import SupabaseStore
+import slack_client
 
 EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # must match embed_index.py
 NOTION_ROOT_PAGE_ID = "3aa40bd1-0676-80f0-ab3e-e189c7b6380b"
@@ -32,9 +33,10 @@ load_env_file(Path(__file__).parent / ".env")
 supabase = SupabaseStore()
 
 USAGE_GUIDE = """\
-이 서버는 GH(Growth Hackers) 학회의 Notion과 Google Drive를 조회하는 도구입니다.
-노션은 활동 기록(프로젝트/기업/사람), 드라이브는 공식 문서/사실 조회 용도로
-역할이 나뉘어 있습니다 - 아래 순서로 도구를 고르세요.
+이 서버는 GH(Growth Hackers) 학회의 Notion, Google Drive, Slack을 조회하는 도구입니다.
+노션은 활동 기록(프로젝트/기업/사람), 드라이브는 공식 문서/사실 조회, 슬랙은
+대화 기록(논의 과정·결정 배경·누가 언제 무슨 말을 했는지) 용도로 역할이 나뉘어
+있습니다 - 아래 순서로 도구를 고르세요.
 
 0. GH 내부 지식에 관한 질문을 받으면 먼저 get_workspace_catalog을 호출해
    팀/DB/문서 유형의 의미와 추천 scope를 확인하세요. 카탈로그의 scope_database와
@@ -99,7 +101,22 @@ DB 간 다단계 탐색 원칙:
       틀린 답이 됩니다). sheet_name 없이 먼저 불러 탭 목록을 확인한 뒉, 기수/시점에
       맞는 탭을 골라 다시 호출하세요.
 
-8. GH 노션·드라이브와 무관한 일반 기술/지식 질문은 도구를 쓰지 말고 바로 답하세요.
+[슬랙 - 대화 기록]
+
+8. 노션에 정리되지 않은 논의, 결정이 내려진 과정, 특정 사람과 주고받은 이야기
+   -> search_slack을 쓰세요. 결과는 질문한 사람이 Slack에서 볼 수 있는 대화
+      (공개 채널, 본인이 속한 비공개 채널·그룹 DM·DM)로만 제한됩니다.
+   -> "Slack이 연결되지 않았습니다" 오류가 나면 connect_slack을 호출해 받은 링크를
+      사용자에게 주고, 연결 후 다시 검색하세요.
+   -> 노션과 교차해서 쓰세요. 노션에서 확인한 프로젝트명·기업명·담당자·기간을
+      search_slack의 query와 since/until(YYYY-MM-DD)에 넣으면 정확해집니다. 반대로
+      슬랙에서 나온 프로젝트·기업·사람은 query_database/fetch_page로 노션 기록을
+      확인하세요.
+   -> thread_ts가 있는 결과는 fetch_slack_thread로 스레드 전체를 읽고, 답변에 슬랙
+      url을 함께 제시하세요. DM·비공개 대화 내용은 질문한 본인만 볼 수 있는
+      자료라는 점을 감안해 인용하세요.
+
+9. GH 노션·드라이브·슬랙과 무관한 일반 기술/지식 질문은 도구를 쓰지 말고 바로 답하세요.
 
 공통 원칙: 답변에는 근거가 된 문서의 url을 함께 제시하세요. 확실하지 않으면
 "찾은 자료 안에서는 확인되지 않음"이라고 명시하고, 없는 내용을 지어내지 마세요.
@@ -1244,10 +1261,15 @@ def read_spreadsheet(file_id: str, sheet_name: str = "") -> str:
 _embed_model: TextEmbedding | None = None
 
 
-def _load_semantic_index():
+def _get_embed_model() -> TextEmbedding:
     global _embed_model
     if _embed_model is None:
         _embed_model = TextEmbedding(model_name=EMBED_MODEL_NAME)
+    return _embed_model
+
+
+def _load_semantic_index():
+    _get_embed_model()
     supabase.require_private()
     rows = supabase.select_all(
         "ghbot_chunks",
@@ -1343,6 +1365,316 @@ def semantic_search(query: str, top_k: int = 5, source: str = "") -> list[dict]:
         }
         for c in scored
     ]
+
+
+# ---------------------------------------------------------------------------
+# Slack: each member's own user token decides what they can search.
+
+SLACK_ACL_TTL_SECONDS = 300
+SLACK_STATE_TTL_SECONDS = 600
+_slack_acl_cache: dict[str, tuple[float, list[str]]] = {}
+_slack_names_cache: tuple[float, dict[str, str]] | None = None
+
+
+def _slack_state_key(state: str) -> str:
+    # The admin store only accepts client/code/access/refresh keys. A one-time
+    # Slack OAuth state is code-like; the prefix inside the hash keeps it
+    # from colliding with ghbot authorization codes.
+    import oauth_provider
+
+    return oauth_provider._secret_key("code", f"slack-state:{state}")
+
+
+def _caller_subject() -> str | None:
+    from mcp.server.auth.middleware.auth_context import get_access_token
+
+    token = get_access_token()
+    return token.subject if token else None
+
+
+def _slack_connection() -> dict:
+    subject = _caller_subject()
+    if subject is None:
+        # Local stdio runs have no ghbot login; allow a developer's own token.
+        local_token = os.environ.get("SLACK_USER_TOKEN")
+        if local_token:
+            return {"subject": "local", "token": local_token, "is_guest": False}
+        raise RuntimeError("Slack 검색은 ghbot 원격 로그인 상태에서만 쓸 수 있습니다.")
+    supabase.require_private()
+    connection = slack_client.load_connection(supabase, subject)
+    if not connection:
+        raise RuntimeError("Slack이 연결되지 않았습니다. connect_slack 도구가 주는 링크로 먼저 연결하세요.")
+    return connection
+
+
+def _slack_call(connection: dict, fn, *args, **kwargs):
+    """Run a Slack call with the member's token; a dead token disconnects them."""
+    try:
+        return fn(*args, **kwargs)
+    except slack_client.SlackError as exc:
+        if exc.error in slack_client.DEAD_TOKEN_ERRORS and connection["subject"] != "local":
+            slack_client.mark_revoked(supabase, connection["subject"])
+            _slack_acl_cache.pop(connection["subject"], None)
+            raise RuntimeError("Slack 연결이 만료됐습니다. connect_slack으로 다시 연결하세요.") from exc
+        raise
+
+
+def _slack_visible_channels(connection: dict) -> list[str]:
+    """Conversations the member is in right now, straight from Slack (cached briefly)."""
+    cached = _slack_acl_cache.get(connection["subject"])
+    if cached and cached[0] > time.time():
+        return cached[1]
+    ids = [c["id"] for c in _slack_call(connection, slack_client.list_conversations, connection["token"])]
+    _slack_acl_cache[connection["subject"]] = (time.time() + SLACK_ACL_TTL_SECONDS, ids)
+    return ids
+
+
+def _slack_names(connection: dict) -> dict[str, str]:
+    global _slack_names_cache
+    if _slack_names_cache and _slack_names_cache[0] > time.time():
+        return _slack_names_cache[1]
+    names = _slack_call(connection, slack_client.user_names, connection["token"])
+    _slack_names_cache = (time.time() + 3600, names)
+    return names
+
+
+def _kst_date_ts(value: str, end_of_day: bool = False) -> float | None:
+    if not value:
+        return None
+    from datetime import datetime
+
+    day = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=slack_client.KST)
+    return day.timestamp() + (86400 if end_of_day else 0)
+
+
+def _resolve_slack_channels(channel: str) -> list[str] | None:
+    if not channel:
+        return None
+    if re.fullmatch(r"[CGD][A-Z0-9]{6,}", channel):
+        return [channel]
+    name = channel.lstrip("#")
+    rows = supabase.select(
+        "ghbot_slack_channels",
+        columns="channel_id",
+        filters=[("name", f"ilike.*{name}*")],
+        limit=50,
+    )
+    return [row["channel_id"] for row in rows] or ["__none__"]
+
+
+@mcp.tool()
+async def connect_slack() -> dict:
+    """Get a link that connects the caller's own Slack account to ghbot.
+
+    Call this when search_slack/fetch_slack_thread says Slack is not connected.
+    Give the returned url to the user; they approve in Slack once. ghbot then
+    searches only what that user can see in Slack (their channels, group DMs
+    and DMs). The link expires in 10 minutes.
+    """
+    import secrets as _secrets
+    from urllib.parse import urlencode
+
+    import oauth_provider
+
+    subject = _caller_subject()
+    client_id = os.environ.get("SLACK_CLIENT_ID")
+    if not subject or not client_id:
+        raise RuntimeError("Slack 연결은 원격 ghbot에서 SLACK_CLIENT_ID가 설정된 경우에만 가능합니다.")
+    state = _secrets.token_urlsafe(24)
+    expires_at = time.time() + SLACK_STATE_TTL_SECONDS
+    await oauth_provider.store(
+        "put",
+        _slack_state_key(state),
+        {"subject": subject, "expires_at": expires_at},
+        expires_at,
+    )
+    query = {
+        "client_id": client_id,
+        "user_scope": ",".join(slack_client.USER_SCOPES),
+        "redirect_uri": f"{OAUTH_ISSUER_URL}/slack/oauth/callback",
+        "state": state,
+    }
+    if os.environ.get("SLACK_TEAM_ID"):
+        query["team"] = os.environ["SLACK_TEAM_ID"]
+    return {
+        "url": f"https://slack.com/oauth/v2/authorize?{urlencode(query)}",
+        "note": "이 링크를 열어 Slack 접근을 승인하면 연결됩니다(10분 내). 승인 후 검색하면 본인이 볼 수 있는 대화만 나옵니다.",
+    }
+
+
+@mcp.tool()
+def disconnect_slack() -> str:
+    """Disconnect the caller's Slack account: revoke and delete their token.
+
+    Already indexed messages stay, but the caller can no longer search Slack,
+    and other members still only see conversations they are in.
+    """
+    subject = _caller_subject()
+    if not subject:
+        raise RuntimeError("원격 ghbot 로그인 상태에서만 쓸 수 있습니다.")
+    connection = slack_client.load_connection(supabase, subject)
+    if connection:
+        try:
+            slack_client.call("auth.revoke", connection["token"])
+        except slack_client.SlackError:
+            pass
+    supabase.delete("ghbot_slack_users", [("subject", f"eq.{subject}")])
+    _slack_acl_cache.pop(subject, None)
+    return "Slack 연결을 해제했습니다."
+
+
+@mcp.tool()
+def search_slack(query: str, top_k: int = 8, channel: str = "", since: str = "", until: str = "") -> list[dict]:
+    """Hybrid keyword + semantic search over Slack messages the caller can see.
+
+    Covers public channels, private channels, group DMs and DMs, limited to
+    conversations the calling member is in right now (public channels for
+    any full member). Each result is a thread or one KST day of a
+    conversation. Use Notion context to sharpen queries: project/company
+    names, people and dates from query_database go into `query` and
+    since/until. `channel` narrows to a channel name ("#general", "general",
+    a DM partner's name) or ID. since/until are YYYY-MM-DD (KST, inclusive).
+    For thread results, read the whole thread with fetch_slack_thread.
+    """
+    connection = _slack_connection()
+    visible = _slack_visible_channels(connection)
+    terms = sorted({t for t in re.findall(r"[\w가-힣]+", query.lower()) if len(t) >= 2})[:8]
+    query_vec = next(_get_embed_model().embed([query]))
+    candidates = supabase.rpc(
+        "ghbot_match_slack",
+        {
+            "query_embedding": np.asarray(query_vec, dtype="float32").tolist(),
+            "channel_ids": visible,
+            "include_public": not connection.get("is_guest"),
+            "query_terms": terms,
+            "match_count": max(50, top_k * 5),
+            "since": _kst_date_ts(since),
+            "until": _kst_date_ts(until, end_of_day=True),
+            "only_channels": _resolve_slack_channels(channel),
+        },
+    )
+    if not candidates:
+        return []
+
+    phrase = query.strip().lower()
+
+    def lexical(item):
+        return item["term_hits"] + (2 if phrase and phrase in item["chunk_text"].lower() else 0)
+
+    semantic_order = sorted(candidates, key=lambda c: c["semantic_score"], reverse=True)
+    lexical_order = [c for c in sorted(candidates, key=lexical, reverse=True) if lexical(c) > 0]
+    semantic_pos = {(c["doc_id"], c["chunk_index"]): i for i, c in enumerate(semantic_order)}
+    lexical_pos = {(c["doc_id"], c["chunk_index"]): i for i, c in enumerate(lexical_order)}
+
+    def fused(item):
+        key = (item["doc_id"], item["chunk_index"])
+        score = 0.65 / (60 + semantic_pos[key] + 1)
+        if key in lexical_pos:
+            score += 0.35 / (60 + lexical_pos[key] + 1)
+        return score
+
+    results = []
+    for c in sorted(candidates, key=fused, reverse=True)[:top_k]:
+        channel_id, kind, ts = c["doc_id"].split(":", 2)
+        results.append({
+            "title": c["title"],
+            "url": c["url"],
+            "text": c["chunk_text"],
+            "channel_id": channel_id,
+            "thread_ts": ts if kind == "t" else None,
+            "start": slack_client.ts_to_kst(c["ts_start"]).strftime("%Y-%m-%d %H:%M"),
+            "end": slack_client.ts_to_kst(c["ts_end"]).strftime("%Y-%m-%d %H:%M"),
+            "score": round(fused(c), 5),
+            "semantic_score": round(c["semantic_score"], 3),
+            "lexical_score": lexical(c),
+        })
+    return results
+
+
+@mcp.tool()
+def fetch_slack_thread(channel_id: str, thread_ts: str) -> str:
+    """Read a whole Slack thread live with the caller's own Slack access.
+
+    Pass channel_id and thread_ts from a search_slack result. Slack itself
+    refuses threads the caller cannot see.
+    """
+    connection = _slack_connection()
+    messages = _slack_call(
+        connection,
+        lambda: list(
+            slack_client.paginate(
+                "conversations.replies", connection["token"], "messages", channel=channel_id, ts=thread_ts, limit=200
+            )
+        ),
+    )
+    names = _slack_names(connection)
+    return "\n".join(slack_client.render_message(m, names) for m in messages[:500])
+
+
+@mcp.custom_route("/slack/oauth/callback", methods=["GET"])
+async def slack_oauth_callback(request):
+    import asyncio
+
+    from starlette.responses import HTMLResponse
+
+    import oauth_provider
+
+    def page(message: str, status: int = 200):
+        import html as html_lib
+
+        return HTMLResponse(
+            '<!doctype html><html><head><meta charset="utf-8"><title>그핵봇 Slack 연결</title></head>'
+            '<body style="font-family:-apple-system,sans-serif;max-width:420px;margin:60px auto;padding:0 16px">'
+            f"<h2>그핵봇 Slack 연결</h2><p>{html_lib.escape(message)}</p></body></html>",
+            status_code=status,
+        )
+
+    params = request.query_params
+    if params.get("error"):
+        return page("Slack 연결이 취소됐습니다.", 400)
+    state, code = params.get("state", ""), params.get("code", "")
+    row = await oauth_provider.store("take", _slack_state_key(state)) if state else None
+    if not row or row.get("expires_at", 0) < time.time() or not code:
+        return page("링크가 만료됐거나 올바르지 않습니다. connect_slack으로 새 링크를 받으세요.", 400)
+
+    try:
+        data = await asyncio.to_thread(
+            slack_client.call,
+            "oauth.v2.access",
+            None,
+            client_id=os.environ["SLACK_CLIENT_ID"],
+            client_secret=os.environ["SLACK_CLIENT_SECRET"],
+            code=code,
+            redirect_uri=f"{OAUTH_ISSUER_URL}/slack/oauth/callback",
+        )
+        authed = data["authed_user"]
+        team_id = (data.get("team") or {}).get("id", "")
+        expected_team = os.environ.get("SLACK_TEAM_ID")
+        if expected_team and team_id != expected_team:
+            return page("GH Slack 워크스페이스 계정으로 연결해야 합니다.", 403)
+        user = (await asyncio.to_thread(slack_client.call, "users.info", authed["access_token"], user=authed["id"]))["user"]
+    except (slack_client.SlackError, KeyError):
+        return page("Slack 인증에 실패했습니다. 다시 시도해 주세요.", 502)
+
+    from datetime import datetime, timezone
+
+    subject = row["subject"]
+    supabase.upsert(
+        "ghbot_slack_users",
+        [{
+            "subject": subject,
+            "slack_user_id": authed["id"],
+            "team_id": team_id,
+            "token_ciphertext": slack_client.encrypt_token(authed["access_token"]),
+            "scopes": authed.get("scope", ""),
+            "is_guest": bool(user.get("is_restricted") or user.get("is_ultra_restricted")),
+            "connected_at": datetime.now(timezone.utc).isoformat(),
+            "revoked_at": None,
+        }],
+        on_conflict="subject",
+    )
+    _slack_acl_cache.pop(subject, None)
+    return page("연결됐습니다. 이제 Claude에서 Slack 내용을 검색할 수 있습니다. 이 창은 닫아도 됩니다.")
 
 
 LOGIN_PAGE = """<!doctype html>
@@ -1444,7 +1776,7 @@ def _build_http_app():
     Host headers (DNS-rebinding protection) when no transport_security is
     given - which 421s every request from a real public domain. Explicitly
     allow the deployed host(s); comma-separated via ALLOWED_HOSTS for
-    flexibility (e.g. adding the *.up.railway.app fallback domain).
+    flexibility (e.g. adding the *.run.app fallback domain).
 
     Bearer-token auth (both OAuth-issued and legacy static tokens) is handled
     by the mcp SDK itself via auth_server_provider - no custom middleware

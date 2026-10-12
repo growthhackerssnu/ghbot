@@ -75,16 +75,10 @@ python3 embed_index.py
 ```
 인덱싱이 끝나면 Supabase 테이블에도 자동 게시됩니다 (수 분 소요, 네트워크 필요).
 
-운영 환경에서는 기존 MCP 웹 서비스와 별도로 Railway Cron 서비스를 하나
-추가하세요. 이 저장소의 `railway.sync.json`을 설정 파일로 사용하거나 Railway
-서비스 설정에 다음을 입력합니다:
-
-```text
-Start command: python sync_worker.py
-Cron schedule: 0 18 * * *  # UTC 18:00 = 한국시간 03:00
-```
-
-Cron 서비스에도 Notion, Google Drive, Supabase 관련 환경변수를 동일하게
-복사해야 합니다. 이 작업은 Supabase의 기존 인덱스를 staging DB에 복원한
+운영 환경에서는 Cloud Run Job `ghbot-sync`가 웹 서비스와 같은 이미지로
+`python sync_worker.py`를 실행하고, Cloud Scheduler가 매일 한국시간 03:00에
+이 잡을 실행합니다. 잡·스케줄러를 처음 만드는 명령은 README의 "Daily sync"를
+참고하세요. 잡에는 Notion, Supabase 관련 환경변수가 필요합니다.
+이 작업은 Supabase의 기존 인덱스를 staging DB에 복원한
 뒤 변경된 프로젝트·Tasks 회의록만 다시 가져와서 Supabase에 게시하고 종료합니다.
 People DB는 개인정보가 임베딩에 들어가지 않도록 동기화 대상에서 제외합니다.
