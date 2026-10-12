@@ -1462,42 +1462,59 @@ def _resolve_slack_channels(channel: str) -> list[str] | None:
     return [row["channel_id"] for row in rows] or ["__none__"]
 
 
-@mcp.tool()
-async def connect_slack() -> dict:
-    """Get a link that connects the caller's own Slack account to ghbot.
-
-    Call this when search_slack/fetch_slack_thread says Slack is not connected.
-    Give the returned url to the user; they approve in Slack once. ghbot then
-    searches only what that user can see in Slack (their channels, group DMs
-    and DMs). The link expires in 10 minutes.
-    """
+async def _slack_authorize_url(subject: str, next_url: str | None = None) -> str:
+    """Start Slack OAuth for a member. next_url, if given, is where the
+    callback sends the browser afterwards (the MCP client during /login)."""
     import secrets as _secrets
     from urllib.parse import urlencode
 
     import oauth_provider
 
-    subject = _caller_subject()
-    client_id = os.environ.get("SLACK_CLIENT_ID")
-    if not subject or not client_id:
-        raise RuntimeError("Slack 연결은 원격 ghbot에서 SLACK_CLIENT_ID가 설정된 경우에만 가능합니다.")
     state = _secrets.token_urlsafe(24)
     expires_at = time.time() + SLACK_STATE_TTL_SECONDS
     await oauth_provider.store(
         "put",
         _slack_state_key(state),
-        {"subject": subject, "expires_at": expires_at},
+        {"subject": subject, "expires_at": expires_at, "next": next_url},
         expires_at,
     )
     query = {
-        "client_id": client_id,
+        "client_id": os.environ["SLACK_CLIENT_ID"],
         "user_scope": ",".join(slack_client.USER_SCOPES),
         "redirect_uri": f"{OAUTH_ISSUER_URL}/slack/oauth/callback",
         "state": state,
     }
     if os.environ.get("SLACK_TEAM_ID"):
         query["team"] = os.environ["SLACK_TEAM_ID"]
+    return f"https://slack.com/oauth/v2/authorize?{urlencode(query)}"
+
+
+def _slack_connected(subject: str) -> bool:
+    try:
+        return bool(supabase.select(
+            "ghbot_slack_users",
+            columns="subject",
+            filters=[("subject", f"eq.{subject}"), ("revoked_at", "is.null")],
+            limit=1,
+        ))
+    except RuntimeError:
+        return False
+
+
+@mcp.tool()
+async def connect_slack() -> dict:
+    """Get a link that (re)connects the caller's own Slack account to ghbot.
+
+    Members normally connect Slack while logging in to ghbot. Call this only
+    when search_slack/fetch_slack_thread says Slack is not connected or the
+    connection expired. Give the returned url to the user; they approve in
+    Slack once. The link expires in 10 minutes.
+    """
+    subject = _caller_subject()
+    if not subject or not os.environ.get("SLACK_CLIENT_ID"):
+        raise RuntimeError("Slack 연결은 원격 ghbot에서 SLACK_CLIENT_ID가 설정된 경우에만 가능합니다.")
     return {
-        "url": f"https://slack.com/oauth/v2/authorize?{urlencode(query)}",
+        "url": await _slack_authorize_url(subject),
         "note": "이 링크를 열어 Slack 접근을 승인하면 연결됩니다(10분 내). 승인 후 검색하면 본인이 볼 수 있는 대화만 나옵니다.",
     }
 
@@ -1630,12 +1647,23 @@ async def slack_oauth_callback(request):
         )
 
     params = request.query_params
-    if params.get("error"):
-        return page("Slack 연결이 취소됐습니다.", 400)
     state, code = params.get("state", ""), params.get("code", "")
     row = await oauth_provider.store("take", _slack_state_key(state)) if state else None
-    if not row or row.get("expires_at", 0) < time.time() or not code:
+    if not row or row.get("expires_at", 0) < time.time():
         return page("링크가 만료됐거나 올바르지 않습니다. connect_slack으로 새 링크를 받으세요.", 400)
+    next_url = row.get("next")
+
+    def done(message: str, status: int = 200):
+        # During ghbot login, Slack is a detour: always finish the MCP login,
+        # even if the member declined Slack (they can connect later).
+        if next_url:
+            from starlette.responses import RedirectResponse
+
+            return RedirectResponse(next_url, status_code=302)
+        return page(message, status)
+
+    if params.get("error") or not code:
+        return done("Slack 연결이 취소됐습니다.", 400)
 
     try:
         data = await asyncio.to_thread(
@@ -1651,10 +1679,10 @@ async def slack_oauth_callback(request):
         team_id = (data.get("team") or {}).get("id", "")
         expected_team = os.environ.get("SLACK_TEAM_ID")
         if expected_team and team_id != expected_team:
-            return page("GH Slack 워크스페이스 계정으로 연결해야 합니다.", 403)
+            return done("GH Slack 워크스페이스 계정으로 연결해야 합니다.", 403)
         user = (await asyncio.to_thread(slack_client.call, "users.info", authed["access_token"], user=authed["id"]))["user"]
     except (slack_client.SlackError, KeyError):
-        return page("Slack 인증에 실패했습니다. 다시 시도해 주세요.", 502)
+        return done("Slack 인증에 실패했습니다. 다시 시도해 주세요.", 502)
 
     from datetime import datetime, timezone
 
@@ -1674,7 +1702,7 @@ async def slack_oauth_callback(request):
         on_conflict="subject",
     )
     _slack_acl_cache.pop(subject, None)
-    return page("연결됐습니다. 이제 Claude에서 Slack 내용을 검색할 수 있습니다. 이 창은 닫아도 됩니다.")
+    return done("연결됐습니다. 이제 Claude에서 Slack 내용을 검색할 수 있습니다. 이 창은 닫아도 됩니다.")
 
 
 LOGIN_PAGE = """<!doctype html>
@@ -1739,7 +1767,7 @@ async def login(request):
     resolved_member = await oauth_provider.resolve_member_token(token)
     if not resolved_member:
         return HTMLResponse(_login_page(params, error="토큰이 올바르지 않습니다."), status_code=401)
-    subject, _member_name = resolved_member
+    subject, member_name = resolved_member
 
     code = "ghcode_" + _secrets.token_urlsafe(24)
     await oauth_provider.save_authorization_code(
@@ -1758,10 +1786,14 @@ async def login(request):
 
     redirect_uri = params.get("redirect_uri", "")
     sep = "&" if "?" in redirect_uri else "?"
-    return RedirectResponse(
-        f"{redirect_uri}{sep}{urlencode({'code': code, 'state': params.get('state', '')})}",
-        status_code=302,
-    )
+    client_redirect = f"{redirect_uri}{sep}{urlencode({'code': code, 'state': params.get('state', '')})}"
+    # Connect Slack as part of logging in: tools see the member's display
+    # name as their subject, so the Slack token is stored under that name.
+    import asyncio
+
+    if os.environ.get("SLACK_CLIENT_ID") and not await asyncio.to_thread(_slack_connected, member_name):
+        return RedirectResponse(await _slack_authorize_url(member_name, client_redirect), status_code=302)
+    return RedirectResponse(client_redirect, status_code=302)
 
 
 @mcp.custom_route("/health", methods=["GET"])

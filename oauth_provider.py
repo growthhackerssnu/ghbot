@@ -22,7 +22,7 @@ from config import load_json_env
 from mcp.server.auth.provider import AccessToken, AuthorizationCode, AuthorizationParams, RefreshToken
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-CODE_TTL_SECONDS = 300
+CODE_TTL_SECONDS = 600  # login may detour through Slack approval first
 ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 180  # 180 days - low-stakes internal tool, avoid re-login churn
 ADMIN_TOKEN_SUBJECT_PREFIX = "admin-token:"
 

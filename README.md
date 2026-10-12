@@ -64,9 +64,12 @@ publish an existing `gh_bot.db`.
 
 ### Slack
 
-Slack has no bot to invite. Each member connects their own Slack account once
-(ask Claude to "connect Slack" - the `connect_slack` tool returns the link),
-and ghbot stores that user token encrypted in `ghbot_slack_users`.
+Slack has no bot to invite. Each member connects their own Slack account as
+part of the ghbot login: after the token form, `/login` sends them through
+Slack's approval and then back to their MCP client (declining still finishes
+the login). Members who skipped it, or whose token expired, can ask Claude
+to "connect Slack" (`connect_slack`). ghbot stores the user token encrypted in
+`ghbot_slack_users`, keyed by the member's display name.
 
 - **Sync:** the nightly job lists every connected member's conversations
   (public, private, group DMs, DMs), crawls each one once, and stores threads
@@ -81,8 +84,9 @@ and ghbot stores that user token encrypted in `ghbot_slack_users`.
   non-guests). A DM between A and B is searchable by A and B only.
   `fetch_slack_thread` reads threads live with the caller's token.
 
-Setup: create the app from [`slack_app_manifest.yml`](slack_app_manifest.yml)
-at api.slack.com/apps, rerun [`supabase_schema.sql`](supabase_schema.sql),
+Setup: the Slack app is `ghbot` (A0C89CVC4JF), created from
+[`slack_app_manifest.yml`](slack_app_manifest.yml). Rerun
+[`supabase_schema.sql`](supabase_schema.sql),
 then set `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_TEAM_ID` and
 `SLACK_TOKEN_ENCRYPTION_KEY` on the service, and `SLACK_TOKEN_ENCRYPTION_KEY`
 on the job.
